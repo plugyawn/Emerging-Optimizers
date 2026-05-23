@@ -9,12 +9,14 @@ from emerging_optimizers.matrix_update_rules import (
     block_diag_feature_gram_to_dense,
     dense_feature_gram_to_block_diag,
     diag_feature_gram_to_block_diag,
+    factorize_feature_gram,
     feature_gram_to_diag,
     locoprop_s_update,
     newton_muon_update,
     newton_schulz_orthogonalize_grouped,
     newton_schulz_orthogonalize,
     right_precondition_with_feature_gram,
+    right_precondition_with_factorized_feature_gram,
 )
 
 
@@ -151,6 +153,48 @@ class MatrixUpdateRulesTest(absltest.TestCase):
 
         self.assertEqual(update.dtype, torch.float32)
         self.assertTrue(torch.isfinite(update).all())
+
+    def test_factorized_dense_feature_gram_matches_uncached_right_precondition(self):
+        grad = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        feature_gram = torch.tensor([[3.0, 0.5], [0.5, 2.0]])
+
+        factorization = factorize_feature_gram(feature_gram, ridge=0.1)
+
+        self.assertEqual(factorization.kind, "dense_cholesky")
+        torch.testing.assert_close(
+            right_precondition_with_factorized_feature_gram(grad, factorization),
+            right_precondition_with_feature_gram(grad, feature_gram, ridge=0.1),
+        )
+
+    def test_factorized_block_diag_feature_gram_matches_uncached_right_precondition(self):
+        grad = torch.tensor([[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]])
+        blocks = torch.tensor(
+            [
+                [[3.0, 0.5], [0.5, 2.0]],
+                [[4.0, 0.0], [0.0, 1.0]],
+            ]
+        )
+
+        factorization = factorize_feature_gram(blocks, ridge=0.1)
+
+        self.assertEqual(factorization.kind, "block_cholesky")
+        torch.testing.assert_close(
+            right_precondition_with_factorized_feature_gram(grad, factorization),
+            right_precondition_with_feature_gram(grad, blocks, ridge=0.1),
+        )
+
+    def test_factorized_diag_feature_gram_caches_regularized_denominator(self):
+        grad = torch.tensor([[2.0, 8.0], [4.0, 16.0]])
+        feature_gram = torch.tensor([2.0, 4.0])
+
+        factorization = factorize_feature_gram(feature_gram, ridge=1.0)
+
+        self.assertEqual(factorization.kind, "diag")
+        torch.testing.assert_close(factorization.factor, torch.tensor([3.0, 5.0]))
+        torch.testing.assert_close(
+            right_precondition_with_factorized_feature_gram(grad, factorization),
+            grad / torch.tensor([3.0, 5.0]),
+        )
 
     def test_right_precondition_diag_feature_gram(self):
         grad = torch.tensor([[2.0, 8.0], [4.0, 16.0]])

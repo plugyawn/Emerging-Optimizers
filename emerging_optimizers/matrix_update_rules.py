@@ -11,6 +11,7 @@ current logical weight as an operand for the update direction.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import chain, cycle, islice, repeat
 from typing import Iterator, Literal, Sequence
 
@@ -28,11 +29,14 @@ __all__ = [
     "block_diag_feature_gram_to_dense",
     "dense_feature_gram_to_block_diag",
     "diag_feature_gram_to_block_diag",
+    "factorize_feature_gram",
+    "FeatureGramFactorization",
     "feature_gram_to_diag",
     "locoprop_s_update",
     "newton_muon_update",
     "newton_schulz_orthogonalize_grouped",
     "newton_schulz_orthogonalize",
+    "right_precondition_with_factorized_feature_gram",
     "right_precondition_with_feature_gram",
 ]
 
@@ -286,13 +290,51 @@ def block_diag_feature_gram_to_dense(
     return dense
 
 
+@dataclass(frozen=True)
+class FeatureGramFactorization:
+    """Reusable solve factor for ``G @ (C + ridge I)^-1``.
+
+    The factorization is intentionally small and representation-aware:
+    diagonal Grams cache the positive denominator, dense Grams cache either a
+    Cholesky factor or the regularized dense Gram for fallback solves, and
+    block-diagonal Grams cache batched block factors. Callers can cache this
+    object across optimizer steps when FEATURE_GRAM refresh cadence is > 1.
+    """
+
+    kind: Literal[
+        "diag",
+        "dense_cholesky",
+        "dense_fallback",
+        "block_cholesky",
+        "block_fallback",
+    ]
+    factor: torch.Tensor
+
+    def right_solve(self, grad: torch.Tensor) -> torch.Tensor:
+        """Solve ``out @ C_reg = grad`` using the cached factor."""
+
+        compute_dtype = _matrix_solve_dtype(self.factor.dtype)
+        grad = grad.to(compute_dtype)
+        factor = self.factor.to(compute_dtype)
+        if self.kind == "diag":
+            return grad / factor
+        if self.kind == "dense_cholesky":
+            return torch.cholesky_solve(grad.mT, factor).mT
+        if self.kind == "dense_fallback":
+            return torch.linalg.solve(factor, grad.mT).mT
+        if self.kind == "block_cholesky":
+            return _right_solve_block_diag_from_factor(grad, factor, cholesky=True)
+        if self.kind == "block_fallback":
+            return _right_solve_block_diag_from_factor(grad, factor, cholesky=False)
+        raise RuntimeError(f"Unsupported FeatureGramFactorization kind: {self.kind}")
+
+
 def _right_solve_dense_spd(grad: torch.Tensor, gram: torch.Tensor) -> torch.Tensor:
     """Solve ``out @ gram = grad`` with a Cholesky fast path."""
 
-    chol, info = torch.linalg.cholesky_ex(gram)
-    if torch.all(info == 0):
-        return torch.cholesky_solve(grad.mT, chol).mT
-    return torch.linalg.solve(gram, grad.mT).mT
+    return FeatureGramFactorization(
+        "dense_cholesky", torch.linalg.cholesky(gram)
+    ).right_solve(grad)
 
 
 def _pad_feature_axis(tensor: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int]:
@@ -304,19 +346,17 @@ def _pad_feature_axis(tensor: torch.Tensor, block_size: int) -> tuple[torch.Tens
     return torch.nn.functional.pad(tensor, (0, pad)), feature_dim
 
 
-def _right_solve_block_diag_spd(grad: torch.Tensor, block_gram: torch.Tensor) -> torch.Tensor:
-    """Solve ``out @ block_diag(block_gram) = grad``.
-
-    ``block_gram`` uses padded fixed-size storage ``[num_blocks, block, block]``.
-    Any padded feature columns in the last block are returned and then cropped
-    back to ``grad.shape[-1]``.
-    """
-
-    if block_gram.ndim != 3 or block_gram.shape[-1] != block_gram.shape[-2]:
-        raise ValueError("block-diagonal feature_gram must have shape [num_blocks, b, b]")
-    block_size = block_gram.shape[-1]
+def _right_solve_block_diag_from_factor(
+    grad: torch.Tensor,
+    block_factor: torch.Tensor,
+    *,
+    cholesky: bool,
+) -> torch.Tensor:
+    if block_factor.ndim != 3 or block_factor.shape[-1] != block_factor.shape[-2]:
+        raise ValueError("block-diagonal solve factor must have shape [num_blocks, b, b]")
+    block_size = block_factor.shape[-1]
     grad_padded, feature_dim = _pad_feature_axis(grad, block_size)
-    num_blocks = block_gram.shape[0]
+    num_blocks = block_factor.shape[0]
     expected_features = num_blocks * block_size
     if grad_padded.shape[-1] != expected_features:
         raise ValueError(
@@ -326,13 +366,18 @@ def _right_solve_block_diag_spd(grad: torch.Tensor, block_gram: torch.Tensor) ->
 
     q = grad_padded.shape[-2]
     grad_blocks = grad_padded.reshape(q, num_blocks, block_size).permute(1, 2, 0)
-    chol, info = torch.linalg.cholesky_ex(block_gram)
-    if torch.all(info == 0):
-        solved = torch.cholesky_solve(grad_blocks, chol)
+    if cholesky:
+        solved = torch.cholesky_solve(grad_blocks, block_factor)
     else:
-        solved = torch.linalg.solve(block_gram, grad_blocks)
+        solved = torch.linalg.solve(block_factor, grad_blocks)
     out = solved.permute(2, 0, 1).reshape(q, expected_features)
     return out[..., :feature_dim]
+
+
+def _right_solve_block_diag_spd(grad: torch.Tensor, block_gram: torch.Tensor) -> torch.Tensor:
+    """Solve ``out @ block_diag(block_gram) = grad`` with a batched Cholesky fast path."""
+
+    return factorize_feature_gram(block_gram).right_solve(grad)
 
 
 def _right_multiply_block_diag(grad: torch.Tensor, block_matrix: torch.Tensor) -> torch.Tensor:
@@ -377,23 +422,47 @@ def right_precondition_with_feature_gram(
     storage ``[num_blocks, block, block]``.
     """
 
+    return factorize_feature_gram(feature_gram, ridge=ridge).right_solve(grad)
+
+
+def factorize_feature_gram(
+    feature_gram: torch.Tensor,
+    *,
+    ridge: float = 0.0,
+) -> FeatureGramFactorization:
+    """Build a reusable right-solve factor for a supported FEATURE_GRAM."""
+
     c = _regularize_feature_gram(feature_gram, ridge)
     compute_dtype = _matrix_solve_dtype(c.dtype)
     c = c.to(compute_dtype)
-    grad = grad.to(compute_dtype)
     if c.ndim == 1:
         if torch.any(c <= 0):
             raise ValueError(
                 "Diagonal feature_gram entries must be positive after ridge regularization."
             )
-        return grad / c
+        return FeatureGramFactorization("diag", c)
     if c.ndim == 2:
-        return _right_solve_dense_spd(grad, c)
+        chol, info = torch.linalg.cholesky_ex(c)
+        if torch.all(info == 0):
+            return FeatureGramFactorization("dense_cholesky", chol)
+        return FeatureGramFactorization("dense_fallback", c)
     if c.ndim == 3:
-        return _right_solve_block_diag_spd(grad, c)
+        chol, info = torch.linalg.cholesky_ex(c)
+        if torch.all(info == 0):
+            return FeatureGramFactorization("block_cholesky", chol)
+        return FeatureGramFactorization("block_fallback", c)
     raise ValueError(
         "feature_gram must be diagonal [p], dense [p, p], or block-diagonal [num_blocks, b, b]"
     )
+
+
+def right_precondition_with_factorized_feature_gram(
+    grad: torch.Tensor,
+    factorization: FeatureGramFactorization,
+) -> torch.Tensor:
+    """Return ``grad @ C_reg^-1`` using a cached FEATURE_GRAM factorization."""
+
+    return factorization.right_solve(grad)
 
 
 def locoprop_s_update(
