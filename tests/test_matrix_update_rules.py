@@ -6,6 +6,10 @@ from absl.testing import absltest
 
 from emerging_optimizers.matrix_update_rules import (
     apply_diag_right_preconditioned_update_,
+    block_diag_feature_gram_to_dense,
+    dense_feature_gram_to_block_diag,
+    diag_feature_gram_to_block_diag,
+    feature_gram_to_diag,
     locoprop_s_update,
     newton_muon_update,
     newton_schulz_orthogonalize_grouped,
@@ -174,6 +178,51 @@ class MatrixUpdateRulesTest(absltest.TestCase):
         expected = torch.linalg.solve(dense, padded_grad.mT).mT[:, :3]
 
         torch.testing.assert_close(actual, expected)
+
+    def test_diag_feature_gram_to_block_diag_is_lossless_storage_embedding(self):
+        diag = torch.tensor([1.0, 2.0, 3.0])
+
+        blocks = diag_feature_gram_to_block_diag(diag, block_size=2)
+
+        self.assertEqual(tuple(blocks.shape), (2, 2, 2))
+        torch.testing.assert_close(feature_gram_to_diag(blocks, feature_dim=3), diag)
+        torch.testing.assert_close(
+            block_diag_feature_gram_to_dense(blocks, feature_dim=3),
+            torch.diag(diag),
+        )
+
+    def test_block_diag_to_diag_drops_only_off_diagonal_block_correlations(self):
+        blocks = torch.tensor(
+            [
+                [[2.0, 0.25], [0.25, 3.0]],
+                [[4.0, -0.5], [-0.5, 5.0]],
+            ]
+        )
+
+        diag = feature_gram_to_diag(blocks, feature_dim=3)
+
+        torch.testing.assert_close(diag, torch.tensor([2.0, 3.0, 4.0]))
+
+    def test_dense_feature_gram_to_block_diag_preserves_within_block_entries(self):
+        dense = torch.tensor(
+            [
+                [1.0, 0.1, 0.2],
+                [0.1, 2.0, 0.3],
+                [0.2, 0.3, 3.0],
+            ]
+        )
+
+        blocks = dense_feature_gram_to_block_diag(dense, block_size=2)
+        projected = block_diag_feature_gram_to_dense(blocks, feature_dim=3)
+
+        expected = torch.tensor(
+            [
+                [1.0, 0.1, 0.0],
+                [0.1, 2.0, 0.0],
+                [0.0, 0.0, 3.0],
+            ]
+        )
+        torch.testing.assert_close(projected, expected)
 
     def test_locoprop_s_block_diag_matches_dense_converged_update(self):
         grad = torch.tensor([[1.0, 2.0, 3.0]])

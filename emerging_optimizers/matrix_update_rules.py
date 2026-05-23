@@ -25,6 +25,10 @@ __all__ = [
     "NSCoeffT",
     "MuonScaleT",
     "apply_diag_right_preconditioned_update_",
+    "block_diag_feature_gram_to_dense",
+    "dense_feature_gram_to_block_diag",
+    "diag_feature_gram_to_block_diag",
+    "feature_gram_to_diag",
     "locoprop_s_update",
     "newton_muon_update",
     "newton_schulz_orthogonalize_grouped",
@@ -159,6 +163,127 @@ def _regularize_feature_gram(feature_gram: torch.Tensor, ridge: float) -> torch.
     raise ValueError(
         "feature_gram must be diagonal [p], dense [p, p], or block-diagonal [num_blocks, b, b]"
     )
+
+
+def feature_gram_to_diag(
+    feature_gram: torch.Tensor,
+    *,
+    feature_dim: int | None = None,
+) -> torch.Tensor:
+    """Project a supported FEATURE_GRAM representation to diagonal storage.
+
+    ``diag`` is lossless for one-dimensional inputs and lossy for dense or
+    block-diagonal inputs because off-diagonal correlations are dropped.
+    ``feature_dim`` crops padded block-diagonal storage back to the logical
+    feature dimension.
+    """
+
+    if feature_gram.ndim == 1:
+        diag = feature_gram
+    elif feature_gram.ndim == 2:
+        if feature_gram.shape[-1] != feature_gram.shape[-2]:
+            raise ValueError("dense feature_gram must be square")
+        diag = torch.diagonal(feature_gram)
+    elif feature_gram.ndim == 3:
+        if feature_gram.shape[-1] != feature_gram.shape[-2]:
+            raise ValueError("block-diagonal feature_gram must have square blocks")
+        diag = torch.diagonal(feature_gram, dim1=-2, dim2=-1).reshape(-1)
+    else:
+        raise ValueError("feature_gram must be diagonal, dense, or block-diagonal")
+    if feature_dim is not None:
+        return diag[..., :feature_dim]
+    return diag
+
+
+def diag_feature_gram_to_block_diag(
+    diag_feature_gram: torch.Tensor,
+    *,
+    block_size: int,
+) -> torch.Tensor:
+    """Embed a diagonal FEATURE_GRAM into padded block-diagonal storage.
+
+    This conversion is lossless with respect to the diagonal approximation: it
+    does not invent missing correlations, it only changes storage layout.
+    """
+
+    if diag_feature_gram.ndim != 1:
+        raise ValueError("diag_feature_gram must be one-dimensional")
+    if block_size < 1:
+        raise ValueError("block_size must be >= 1")
+    padded, _ = _pad_feature_axis(diag_feature_gram, block_size)
+    num_blocks = padded.numel() // block_size
+    blocks = torch.zeros(
+        (num_blocks, block_size, block_size),
+        device=diag_feature_gram.device,
+        dtype=diag_feature_gram.dtype,
+    )
+    block_diags = padded.reshape(num_blocks, block_size)
+    idx = torch.arange(block_size, device=diag_feature_gram.device)
+    blocks[:, idx, idx] = block_diags
+    return blocks
+
+
+def dense_feature_gram_to_block_diag(
+    dense_feature_gram: torch.Tensor,
+    *,
+    block_size: int,
+) -> torch.Tensor:
+    """Project a dense FEATURE_GRAM to padded block-diagonal storage.
+
+    This drops cross-block feature correlations while preserving within-block
+    correlations.
+    """
+
+    if dense_feature_gram.ndim != 2 or dense_feature_gram.shape[-1] != dense_feature_gram.shape[-2]:
+        raise ValueError("dense_feature_gram must be square [p, p]")
+    if block_size < 1:
+        raise ValueError("block_size must be >= 1")
+    feature_dim = dense_feature_gram.shape[-1]
+    padded_dim = ((feature_dim + block_size - 1) // block_size) * block_size
+    if padded_dim != feature_dim:
+        dense_feature_gram = torch.nn.functional.pad(
+            dense_feature_gram, (0, padded_dim - feature_dim, 0, padded_dim - feature_dim)
+        )
+    num_blocks = padded_dim // block_size
+    blocks = torch.empty(
+        (num_blocks, block_size, block_size),
+        device=dense_feature_gram.device,
+        dtype=dense_feature_gram.dtype,
+    )
+    for block_idx in range(num_blocks):
+        start = block_idx * block_size
+        end = start + block_size
+        blocks[block_idx].copy_(dense_feature_gram[start:end, start:end])
+    return blocks
+
+
+def block_diag_feature_gram_to_dense(
+    block_feature_gram: torch.Tensor,
+    *,
+    feature_dim: int | None = None,
+) -> torch.Tensor:
+    """Materialize padded block-diagonal storage as a dense matrix.
+
+    This is primarily for testing, diagnostics, and reference implementations.
+    Production matrix rules should consume block storage directly.
+    """
+
+    if block_feature_gram.ndim != 3 or block_feature_gram.shape[-1] != block_feature_gram.shape[-2]:
+        raise ValueError("block_feature_gram must have shape [num_blocks, b, b]")
+    num_blocks, block_size, _ = block_feature_gram.shape
+    padded_dim = num_blocks * block_size
+    dense = torch.zeros(
+        (padded_dim, padded_dim),
+        device=block_feature_gram.device,
+        dtype=block_feature_gram.dtype,
+    )
+    for block_idx in range(num_blocks):
+        start = block_idx * block_size
+        end = start + block_size
+        dense[start:end, start:end] = block_feature_gram[block_idx]
+    if feature_dim is not None:
+        return dense[:feature_dim, :feature_dim]
+    return dense
 
 
 def _right_solve_dense_spd(grad: torch.Tensor, gram: torch.Tensor) -> torch.Tensor:
