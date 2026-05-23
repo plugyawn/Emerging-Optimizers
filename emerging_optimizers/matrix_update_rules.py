@@ -24,8 +24,10 @@ __all__ = [
     "CoeffIterMode",
     "NSCoeffT",
     "MuonScaleT",
+    "apply_diag_right_preconditioned_update_",
     "locoprop_s_update",
     "newton_muon_update",
+    "newton_schulz_orthogonalize_grouped",
     "newton_schulz_orthogonalize",
     "right_precondition_with_feature_gram",
 ]
@@ -137,14 +139,92 @@ def _matrix_solve_dtype(dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
+def _add_ridge_to_dense_or_blocks(feature_gram: torch.Tensor, ridge: float) -> torch.Tensor:
+    if ridge == 0.0:
+        return feature_gram
+    eye = torch.eye(
+        feature_gram.shape[-1], device=feature_gram.device, dtype=feature_gram.dtype
+    )
+    return feature_gram + ridge * eye
+
+
 def _regularize_feature_gram(feature_gram: torch.Tensor, ridge: float) -> torch.Tensor:
     if ridge == 0.0:
         return feature_gram
     feature_gram = feature_gram.to(_matrix_solve_dtype(feature_gram.dtype))
     if feature_gram.ndim == 1:
         return feature_gram + ridge
-    eye = torch.eye(feature_gram.shape[-1], device=feature_gram.device, dtype=feature_gram.dtype)
-    return feature_gram + ridge * eye
+    if feature_gram.ndim in (2, 3):
+        return _add_ridge_to_dense_or_blocks(feature_gram, ridge)
+    raise ValueError(
+        "feature_gram must be diagonal [p], dense [p, p], or block-diagonal [num_blocks, b, b]"
+    )
+
+
+def _right_solve_dense_spd(grad: torch.Tensor, gram: torch.Tensor) -> torch.Tensor:
+    """Solve ``out @ gram = grad`` with a Cholesky fast path."""
+
+    chol, info = torch.linalg.cholesky_ex(gram)
+    if torch.all(info == 0):
+        return torch.cholesky_solve(grad.mT, chol).mT
+    return torch.linalg.solve(gram, grad.mT).mT
+
+
+def _pad_feature_axis(tensor: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int]:
+    feature_dim = tensor.shape[-1]
+    padded_dim = ((feature_dim + block_size - 1) // block_size) * block_size
+    pad = padded_dim - feature_dim
+    if pad == 0:
+        return tensor, feature_dim
+    return torch.nn.functional.pad(tensor, (0, pad)), feature_dim
+
+
+def _right_solve_block_diag_spd(grad: torch.Tensor, block_gram: torch.Tensor) -> torch.Tensor:
+    """Solve ``out @ block_diag(block_gram) = grad``.
+
+    ``block_gram`` uses padded fixed-size storage ``[num_blocks, block, block]``.
+    Any padded feature columns in the last block are returned and then cropped
+    back to ``grad.shape[-1]``.
+    """
+
+    if block_gram.ndim != 3 or block_gram.shape[-1] != block_gram.shape[-2]:
+        raise ValueError("block-diagonal feature_gram must have shape [num_blocks, b, b]")
+    block_size = block_gram.shape[-1]
+    grad_padded, feature_dim = _pad_feature_axis(grad, block_size)
+    num_blocks = block_gram.shape[0]
+    expected_features = num_blocks * block_size
+    if grad_padded.shape[-1] != expected_features:
+        raise ValueError(
+            f"block-diagonal feature_gram expects {expected_features} features, "
+            f"got {grad.shape[-1]}."
+        )
+
+    q = grad_padded.shape[-2]
+    grad_blocks = grad_padded.reshape(q, num_blocks, block_size).permute(1, 2, 0)
+    chol, info = torch.linalg.cholesky_ex(block_gram)
+    if torch.all(info == 0):
+        solved = torch.cholesky_solve(grad_blocks, chol)
+    else:
+        solved = torch.linalg.solve(block_gram, grad_blocks)
+    out = solved.permute(2, 0, 1).reshape(q, expected_features)
+    return out[..., :feature_dim]
+
+
+def _right_multiply_block_diag(grad: torch.Tensor, block_matrix: torch.Tensor) -> torch.Tensor:
+    if block_matrix.ndim != 3 or block_matrix.shape[-1] != block_matrix.shape[-2]:
+        raise ValueError("block_matrix must have shape [num_blocks, b, b]")
+    block_size = block_matrix.shape[-1]
+    grad_padded, feature_dim = _pad_feature_axis(grad, block_size)
+    q = grad_padded.shape[-2]
+    num_blocks = block_matrix.shape[0]
+    expected_features = num_blocks * block_size
+    if grad_padded.shape[-1] != expected_features:
+        raise ValueError(
+            f"block matrix expects {expected_features} features, got {grad.shape[-1]}."
+        )
+    grad_blocks = grad_padded.reshape(q, num_blocks, block_size).permute(1, 0, 2)
+    out = torch.bmm(grad_blocks, block_matrix).permute(1, 0, 2).reshape(q, expected_features)
+    return out[..., :feature_dim]
 
 
 def _muon_scale_factor(size_out: int, size_in: int, mode: MuonScaleT) -> float:
@@ -167,7 +247,9 @@ def right_precondition_with_feature_gram(
 ) -> torch.Tensor:
     """Return ``grad @ (feature_gram + ridge I)^-1``.
 
-    A one-dimensional ``feature_gram`` is interpreted as a diagonal Gram.
+    A one-dimensional ``feature_gram`` is interpreted as a diagonal Gram. A
+    three-dimensional ``feature_gram`` is interpreted as padded block-diagonal
+    storage ``[num_blocks, block, block]``.
     """
 
     c = _regularize_feature_gram(feature_gram, ridge)
@@ -180,7 +262,13 @@ def right_precondition_with_feature_gram(
                 "Diagonal feature_gram entries must be positive after ridge regularization."
             )
         return grad / c
-    return torch.linalg.solve(c, grad.mT).mT
+    if c.ndim == 2:
+        return _right_solve_dense_spd(grad, c)
+    if c.ndim == 3:
+        return _right_solve_block_diag_spd(grad, c)
+    raise ValueError(
+        "feature_gram must be diagonal [p], dense [p, p], or block-diagonal [num_blocks, b, b]"
+    )
 
 
 def locoprop_s_update(
@@ -221,6 +309,16 @@ def locoprop_s_update(
             powers = powers + running
         return -inner_lr * gamma * grad * powers
 
+    if c.ndim == 3:
+        identity = torch.eye(c.shape[-1], device=c.device, dtype=c.dtype).expand_as(c)
+        base = identity - inner_lr * c
+        powers = identity.clone()
+        running = identity.clone()
+        for _ in range(1, inner_steps):
+            running = torch.bmm(running, base)
+            powers = powers + running
+        return -inner_lr * gamma * _right_multiply_block_diag(grad, powers)
+
     identity = torch.eye(c.shape[-1], device=c.device, dtype=c.dtype)
     base = identity - inner_lr * c
     powers = identity.clone()
@@ -258,3 +356,71 @@ def newton_muon_update(
     )
     scale = _muon_scale_factor(grad.size(-2), grad.size(-1), scale_mode)
     return -orthogonalized * scale * extra_scale_factor
+
+
+def apply_diag_right_preconditioned_update_(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    diag_feature_gram: torch.Tensor,
+    *,
+    lr: float,
+    ridge: float = 0.0,
+    update_scale: float = 1.0,
+    weight_decay: float = 0.0,
+    decoupled_weight_decay: bool = True,
+) -> torch.Tensor:
+    """Apply a diagonal right-preconditioned update in-place.
+
+    This is the fused diagonal LocoProp-S/Newton-Muon preconditioning building
+    block: optional weight decay, ``grad / (diag(C) + ridge)``, update scale,
+    learning rate, and parameter add are performed without materializing a
+    dense feature Gram. It is intentionally limited to diagonal factors.
+    """
+
+    if diag_feature_gram.ndim != 1:
+        raise ValueError("diag_feature_gram must be one-dimensional")
+    if weight_decay != 0.0 and decoupled_weight_decay:
+        param.mul_(1.0 - lr * weight_decay)
+    update_grad = grad
+    if weight_decay != 0.0 and not decoupled_weight_decay:
+        update_grad = grad.add(param, alpha=weight_decay)
+    denom = diag_feature_gram.to(update_grad.dtype) + ridge
+    if torch.any(denom <= 0):
+        raise ValueError("Diagonal feature_gram entries must be positive after ridge regularization.")
+    param.add_(update_grad / denom, alpha=-lr * update_scale)
+    return param
+
+
+def newton_schulz_orthogonalize_grouped(
+    matrices: Sequence[torch.Tensor],
+    *,
+    steps: int,
+    coefficient_type: NSCoeffT = "quintic",
+    custom_coefficient_sets: list[tuple[float, float, float]] | None = None,
+    eps: float = 1e-7,
+) -> list[torch.Tensor]:
+    """Run Newton-Schulz on same-shaped matrices as batched GEMMs.
+
+    Matrices are grouped by ``(shape, dtype, device)`` and stacked, so same-shape
+    transformer blocks use batched matmuls rather than one Python launch chain
+    per parameter. This is a generic Torch implementation; CUDA-specific grouped
+    GEMM kernels can replace this helper without changing callers.
+    """
+
+    groups: dict[tuple[tuple[int, ...], torch.dtype, torch.device], list[tuple[int, torch.Tensor]]] = {}
+    for index, matrix in enumerate(matrices):
+        groups.setdefault((tuple(matrix.shape), matrix.dtype, matrix.device), []).append((index, matrix))
+
+    outputs: list[torch.Tensor | None] = [None] * len(matrices)
+    for _, indexed in groups.items():
+        batch = torch.stack([matrix for _, matrix in indexed], dim=0)
+        batch_out = newton_schulz_orthogonalize(
+            batch,
+            steps=steps,
+            coefficient_type=coefficient_type,
+            custom_coefficient_sets=custom_coefficient_sets,
+            eps=eps,
+        )
+        for batch_index, (original_index, _) in enumerate(indexed):
+            outputs[original_index] = batch_out[batch_index]
+    return [out for out in outputs if out is not None]

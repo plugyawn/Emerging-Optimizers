@@ -5,8 +5,10 @@ import torch
 from absl.testing import absltest
 
 from emerging_optimizers.matrix_update_rules import (
+    apply_diag_right_preconditioned_update_,
     locoprop_s_update,
     newton_muon_update,
+    newton_schulz_orthogonalize_grouped,
     newton_schulz_orthogonalize,
     right_precondition_with_feature_gram,
 )
@@ -155,6 +157,94 @@ class MatrixUpdateRulesTest(absltest.TestCase):
             torch.tensor([[1.0, 2.0], [2.0, 4.0]]),
         )
 
+    def test_right_precondition_block_diag_matches_dense_block_matrix(self):
+        grad = torch.tensor([[1.0, 2.0, 3.0], [0.5, -1.0, 2.0]])
+        blocks = torch.tensor(
+            [
+                [[3.0, 0.5], [0.5, 2.0]],
+                [[4.0, 0.0], [0.0, 1.0]],
+            ]
+        )
+        dense = torch.zeros(4, 4)
+        dense[:2, :2] = blocks[0]
+        dense[2:, 2:] = blocks[1]
+        padded_grad = torch.nn.functional.pad(grad, (0, 1))
+
+        actual = right_precondition_with_feature_gram(grad, blocks)
+        expected = torch.linalg.solve(dense, padded_grad.mT).mT[:, :3]
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_locoprop_s_block_diag_matches_dense_converged_update(self):
+        grad = torch.tensor([[1.0, 2.0, 3.0]])
+        blocks = torch.tensor(
+            [
+                [[2.0, 0.25], [0.25, 1.5]],
+                [[3.0, 0.0], [0.0, 1.0]],
+            ]
+        )
+        dense = torch.zeros(4, 4)
+        dense[:2, :2] = blocks[0]
+        dense[2:, 2:] = blocks[1]
+        padded_grad = torch.nn.functional.pad(grad, (0, 1))
+        gamma = 0.7
+        ridge = 0.1
+
+        actual = locoprop_s_update(grad, blocks, gamma=gamma, ridge=ridge)
+        expected = -gamma * torch.linalg.solve(
+            dense + ridge * torch.eye(4), padded_grad.mT
+        ).mT[:, :3]
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_locoprop_s_block_diag_finite_steps_matches_dense_blocks(self):
+        grad = torch.tensor([[1.0, -0.5, 2.0]])
+        blocks = torch.tensor(
+            [
+                [[1.5, 0.25], [0.25, 1.25]],
+                [[2.0, 0.0], [0.0, 1.0]],
+            ]
+        )
+        dense = torch.zeros(4, 4)
+        dense[:2, :2] = blocks[0]
+        dense[2:, 2:] = blocks[1]
+        padded_grad = torch.nn.functional.pad(grad, (0, 1))
+        inner_lr = 0.05
+        inner_steps = 4
+        identity = torch.eye(4)
+        base = identity - inner_lr * dense
+        powers = identity.clone()
+        running = identity.clone()
+        for _ in range(1, inner_steps):
+            running = running @ base
+            powers = powers + running
+
+        actual = locoprop_s_update(
+            grad, blocks, inner_lr=inner_lr, inner_steps=inner_steps
+        )
+        expected = -inner_lr * padded_grad.matmul(powers)[:, :3]
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_apply_diag_right_preconditioned_update_inplace(self):
+        param = torch.ones(2, 3)
+        grad = torch.tensor([[2.0, 4.0, 6.0], [1.0, 2.0, 3.0]])
+        diag = torch.tensor([1.0, 3.0, 5.0])
+
+        apply_diag_right_preconditioned_update_(
+            param,
+            grad,
+            diag,
+            lr=0.1,
+            ridge=1.0,
+            update_scale=0.5,
+            weight_decay=0.2,
+            decoupled_weight_decay=True,
+        )
+
+        expected = torch.ones(2, 3) * 0.98 - 0.05 * grad / (diag + 1.0)
+        torch.testing.assert_close(param, expected)
+
     def test_right_precondition_diag_feature_gram_rejects_singular_without_ridge(self):
         grad = torch.tensor([[2.0, 8.0]])
         feature_gram = torch.tensor([2.0, 0.0])
@@ -202,6 +292,24 @@ class MatrixUpdateRulesTest(absltest.TestCase):
         ref = newton_schulz_orthogonalize(grad, steps=1, coefficient_type="simple")
 
         torch.testing.assert_close(update, -ref * (max(grad.shape) ** 0.5))
+
+    def test_newton_schulz_grouped_matches_per_matrix_results(self):
+        matrices = [
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
+            torch.tensor([[0.5, -1.0], [2.0, 1.0]], dtype=torch.float32),
+            torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32),
+        ]
+
+        grouped = newton_schulz_orthogonalize_grouped(
+            matrices, steps=2, coefficient_type="simple"
+        )
+        refs = [
+            newton_schulz_orthogonalize(m, steps=2, coefficient_type="simple")
+            for m in matrices
+        ]
+
+        for actual, expected in zip(grouped, refs):
+            torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":
