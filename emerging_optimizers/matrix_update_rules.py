@@ -573,6 +573,24 @@ def apply_diag_right_preconditioned_update_(
 
     if diag_feature_gram.ndim != 1:
         raise ValueError("diag_feature_gram must be one-dimensional")
+    if param.is_cuda and grad.is_cuda and diag_feature_gram.is_cuda:
+        try:
+            from emerging_optimizers.triton_kernels.feature_gram import (
+                apply_diag_right_preconditioned_update_kernel_,
+            )
+
+            return apply_diag_right_preconditioned_update_kernel_(
+                param,
+                grad,
+                diag_feature_gram,
+                lr=lr,
+                ridge=ridge,
+                update_scale=update_scale,
+                weight_decay=weight_decay,
+                decoupled_weight_decay=decoupled_weight_decay,
+            )
+        except Exception:
+            pass
     if weight_decay != 0.0 and decoupled_weight_decay:
         param.mul_(1.0 - lr * weight_decay)
     update_grad = grad
