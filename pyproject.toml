@@ -92,7 +92,7 @@ managed = true
 include = ["emerging_optimizers", "emerging_optimizers.*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "emerging_optimizers.__version__"}
+version = {attr = "emerging_optimizers.package_info.__version__"}
 readme = {file = "README.md", content-type = "text/markdown"}
 
 [project.urls]
@@ -185,4 +185,3 @@ exclude_also = [
     "@abstractmethod",
     "if TYPE_CHECKING:",
 ]
-

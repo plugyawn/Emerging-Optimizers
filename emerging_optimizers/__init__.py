@@ -24,3 +24,5 @@ from emerging_optimizers.package_info import (
     __shortversion__,
     __version__,
 )
+from emerging_optimizers.matrix_update_rules import *
+from emerging_optimizers.matrix_tp_apply import *
