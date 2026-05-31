@@ -309,9 +309,11 @@ def newton_schulz_step(
     A = X @ X.mT
     if tp_group is not None:
         torch.distributed.all_reduce(A, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-    B = torch.addmm(A, A, A, alpha=c, beta=b)
-    X = torch.addmm(X, B, X, alpha=1.0, beta=a)
-    return X
+    if X.ndim == 2:
+        B = torch.addmm(A, A, A, alpha=c, beta=b)
+        return torch.addmm(X, B, X, alpha=1.0, beta=a)
+    B = b * A + c * (A @ A)
+    return a * X + B @ X
 
 
 def newton_schulz_step_tsyrk(

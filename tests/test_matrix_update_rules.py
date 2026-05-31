@@ -5,6 +5,7 @@ import torch
 from absl.testing import absltest
 
 from emerging_optimizers.matrix_update_rules import (
+    apply_diag_newton_muon_update_,
     apply_diag_right_preconditioned_update_,
     block_diag_feature_gram_to_dense,
     dense_feature_gram_to_block_diag,
@@ -385,6 +386,44 @@ class MatrixUpdateRulesTest(absltest.TestCase):
         ref = newton_schulz_orthogonalize(grad, steps=1, coefficient_type="simple")
 
         torch.testing.assert_close(update, -ref * (max(grad.shape) ** 0.5))
+
+    def test_apply_diag_newton_muon_update_matches_out_of_place_rule(self):
+        param = torch.ones(2, 3, dtype=torch.float32)
+        grad = torch.tensor([[2.0, 4.0, 6.0], [1.0, 2.0, 3.0]], dtype=torch.float32)
+        diag = torch.tensor([1.0, 3.0, 5.0], dtype=torch.float32)
+        lr = 0.1
+        weight_decay = 0.2
+
+        expected = param.clone()
+        expected.mul_(1.0 - lr * weight_decay)
+        expected.add_(
+            newton_muon_update(
+                grad,
+                diag,
+                ridge=1.0,
+                num_ns_steps=2,
+                coefficient_type="simple",
+                scale_mode="none",
+            ),
+            alpha=lr,
+        )
+
+        apply_diag_newton_muon_update_(
+            param,
+            grad,
+            diag,
+            lr=lr,
+            ridge=1.0,
+            num_ns_steps=2,
+            coefficient_type="simple",
+            scale_mode="none",
+            weight_decay=weight_decay,
+            decoupled_weight_decay=True,
+            fp32_matmul_prec="highest",
+            use_syrk=False,
+        )
+
+        torch.testing.assert_close(param, expected)
 
     def test_newton_schulz_grouped_matches_per_matrix_results(self):
         matrices = [

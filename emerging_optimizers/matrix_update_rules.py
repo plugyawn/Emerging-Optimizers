@@ -12,10 +12,14 @@ current logical weight as an operand for the update direction.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import chain, cycle, islice, repeat
-from typing import Iterator, Literal, Sequence
+from typing import Literal
 
 import torch
+
+from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+    newton_schulz as _shared_newton_schulz,
+)
+from emerging_optimizers.utils import fp32_matmul_precision
 
 CoeffIterMode = Literal["cycle", "repeat_last"]
 NSCoeffT = Literal["simple", "quintic", "polar_express", "cans", "aol", "custom"]
@@ -25,6 +29,7 @@ __all__ = [
     "CoeffIterMode",
     "NSCoeffT",
     "MuonScaleT",
+    "apply_diag_newton_muon_update_",
     "apply_diag_right_preconditioned_update_",
     "block_diag_feature_gram_to_dense",
     "dense_feature_gram_to_block_diag",
@@ -40,59 +45,6 @@ __all__ = [
     "right_precondition_with_feature_gram",
 ]
 
-# Kept local to avoid importing the orthogonalized optimizer package on CPU-only
-# test paths; that package imports Triton kernels at module import time.
-_COEFFICIENT_SETS: dict[str, list[tuple[float, float, float]]] = {
-    "simple": [(3.4445, -4.7750, 2.0315)],
-    "quintic": [
-        (4.0848, -6.8946, 2.9270),
-        (3.9505, -6.3029, 2.6377),
-        (3.7418, -5.5913, 2.3037),
-        (2.8769, -3.1427, 1.2046),
-        (2.8366, -3.0525, 1.2012),
-    ],
-    "polar_express": [
-        (8.2051, -22.9019, 16.4607),
-        (4.0664, -2.8612, 0.5184),
-        (3.9096, -2.8234, 0.5250),
-        (3.2856, -2.4153, 0.4853),
-        (2.2779, -1.6198, 0.3985),
-        (1.8726, -1.2307, 0.3585),
-        (1.8564, -1.2132, 0.3568),
-        (1.8750, -1.2500, 0.3750),
-    ],
-    "cans": [
-        (8.4703, -25.1081, 18.6293),
-        (4.1828, -3.1087, 0.5806),
-        (3.9619, -2.9541, 0.5630),
-        (3.2866, -2.4647, 0.5074),
-        (2.2737, -1.6447, 0.4162),
-    ],
-    "aol": [
-        (4.0098, -7.0585, 2.4635),
-        (3.4585, -5.5479, 2.5959),
-        (2.7573, -3.2939, 1.4254),
-        (2.7215, -3.0494, 1.3169),
-    ],
-}
-
-
-def _get_coefficient_iterator(
-    steps: int,
-    coefficient_sets: Sequence[tuple[float, float, float]],
-    mode: CoeffIterMode = "cycle",
-) -> Iterator[tuple[float, float, float]]:
-    if not coefficient_sets:
-        raise ValueError("coefficient_sets must be non-empty")
-    if mode == "cycle":
-        base: Iterator[tuple[float, float, float]] = cycle(coefficient_sets)
-    elif mode == "repeat_last":
-        base = chain(coefficient_sets, repeat(coefficient_sets[-1]))
-    else:
-        raise ValueError(f"Invalid coefficient iterator mode: {mode}")
-    return islice(base, steps)
-
-
 def newton_schulz_orthogonalize(
     x: torch.Tensor,
     *,
@@ -101,44 +53,19 @@ def newton_schulz_orthogonalize(
     custom_coefficient_sets: list[tuple[float, float, float]] | None = None,
     eps: float = 1e-7,
     transpose: bool | None = None,
+    use_syrk: bool = False,
 ) -> torch.Tensor:
-    """Torch-only Newton-Schulz orthogonalization used by matrix rules."""
+    """Newton-Schulz/Polar Express wrapper shared with the Muon optimizer."""
 
-    if x.ndim < 2:
-        raise ValueError("Input tensor x must have at least 2 dimensions")
-    if x.dtype != torch.float32:
-        raise ValueError(f"Input tensor x must be in float32, got {x.dtype}")
-    if steps < 0:
-        raise ValueError("steps must be >= 0")
-
-    if transpose is None:
-        transpose = x.size(-2) > x.size(-1)
-    if transpose:
-        x = x.mT
-
-    out = torch.nn.functional.normalize(x, p=2, dim=(-2, -1), eps=eps)  # type: ignore[arg-type]
-
-    if coefficient_type in _COEFFICIENT_SETS:
-        coefficient_sets = _COEFFICIENT_SETS[coefficient_type]
-    elif coefficient_type == "custom":
-        if custom_coefficient_sets is None:
-            raise ValueError(
-                "custom_coefficient_sets must be provided when coefficient_type is 'custom'"
-            )
-        coefficient_sets = custom_coefficient_sets
-    else:
-        raise ValueError(f"Invalid coefficient type: {coefficient_type}")
-
-    iter_mode: CoeffIterMode = (
-        "repeat_last" if coefficient_type in ("polar_express", "cans") else "cycle"
+    return _shared_newton_schulz(
+        x,
+        steps=steps,
+        coefficient_type=coefficient_type,
+        custom_coefficient_sets=custom_coefficient_sets,
+        eps=eps,
+        transpose=transpose,
+        use_syrk=use_syrk,
     )
-    for a, b, c in _get_coefficient_iterator(steps, coefficient_sets, mode=iter_mode):
-        gram = out @ out.mT
-        out = a * out + (b * gram + c * gram @ gram) @ out
-
-    if transpose:
-        out = out.mT
-    return out.to(torch.float32)
 
 
 def _matrix_solve_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -552,6 +479,82 @@ def newton_muon_update(
     return -orthogonalized * scale * extra_scale_factor
 
 
+def apply_diag_newton_muon_update_(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    diag_feature_gram: torch.Tensor,
+    *,
+    lr: float,
+    ridge: float = 0.0,
+    num_ns_steps: int = 5,
+    coefficient_type: NSCoeffT = "quintic",
+    custom_coefficient_sets: list[tuple[float, float, float]] | None = None,
+    scale_mode: MuonScaleT = "spectral",
+    extra_scale_factor: float = 1.0,
+    weight_decay: float = 0.0,
+    decoupled_weight_decay: bool = True,
+    fp32_matmul_prec: str = "medium",
+    use_syrk: bool = False,
+) -> torch.Tensor:
+    """Apply the diagonal Newton-Muon update in-place.
+
+    This is the end-to-end diagonal FEATURE_GRAM path:
+    ``grad / (diag(C) + ridge)`` is materialized directly as the Newton-Schulz
+    operand, Polar Express/NS uses the shared Muon implementation, and the
+    scaled parameter update is applied in-place. Dense and block-diagonal
+    FEATURE_GRAM variants intentionally stay on the generic solve path.
+    """
+
+    if param.ndim != 2 or grad.ndim != 2:
+        raise ValueError("param and grad must be two-dimensional")
+    if param.shape != grad.shape:
+        raise ValueError("param and grad must have matching shapes")
+    if diag_feature_gram.ndim != 1:
+        raise ValueError("diag_feature_gram must be one-dimensional")
+    if diag_feature_gram.shape[0] != grad.shape[-1]:
+        raise ValueError("diag_feature_gram length must match the parameter feature dimension")
+
+    from emerging_optimizers.triton_kernels.feature_gram import (
+        apply_matrix_update_kernel_,
+        diag_right_precondition_matrix,
+    )
+
+    preconditioned = diag_right_precondition_matrix(
+        grad,
+        diag_feature_gram,
+        param=param,
+        ridge=ridge,
+        weight_decay=weight_decay,
+        decoupled_weight_decay=decoupled_weight_decay,
+    )
+
+    with fp32_matmul_precision(fp32_matmul_prec):  # type: ignore[arg-type]
+        orthogonalized = newton_schulz_orthogonalize(
+            preconditioned.to(torch.float32),
+            steps=num_ns_steps,
+            coefficient_type=coefficient_type,
+            custom_coefficient_sets=custom_coefficient_sets,
+            use_syrk=use_syrk,
+        )
+
+    scale = _muon_scale_factor(grad.size(-2), grad.size(-1), scale_mode) * extra_scale_factor
+    if param.is_cuda and orthogonalized.is_cuda:
+        apply_matrix_update_kernel_(
+            param,
+            orthogonalized,
+            lr=lr,
+            update_scale=scale,
+            weight_decay=weight_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+        )
+        return param
+
+    if weight_decay != 0.0 and decoupled_weight_decay:
+        param.mul_(1.0 - lr * weight_decay)
+    param.add_(orthogonalized.to(param.dtype), alpha=-lr * scale)
+    return param
+
+
 def apply_diag_right_preconditioned_update_(
     param: torch.Tensor,
     grad: torch.Tensor,
@@ -574,23 +577,20 @@ def apply_diag_right_preconditioned_update_(
     if diag_feature_gram.ndim != 1:
         raise ValueError("diag_feature_gram must be one-dimensional")
     if param.is_cuda and grad.is_cuda and diag_feature_gram.is_cuda:
-        try:
-            from emerging_optimizers.triton_kernels.feature_gram import (
-                apply_diag_right_preconditioned_update_kernel_,
-            )
+        from emerging_optimizers.triton_kernels.feature_gram import (
+            apply_diag_right_preconditioned_update_kernel_,
+        )
 
-            return apply_diag_right_preconditioned_update_kernel_(
-                param,
-                grad,
-                diag_feature_gram,
-                lr=lr,
-                ridge=ridge,
-                update_scale=update_scale,
-                weight_decay=weight_decay,
-                decoupled_weight_decay=decoupled_weight_decay,
-            )
-        except Exception:
-            pass
+        return apply_diag_right_preconditioned_update_kernel_(
+            param,
+            grad,
+            diag_feature_gram,
+            lr=lr,
+            ridge=ridge,
+            update_scale=update_scale,
+            weight_decay=weight_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+        )
     if weight_decay != 0.0 and decoupled_weight_decay:
         param.mul_(1.0 - lr * weight_decay)
     update_grad = grad
