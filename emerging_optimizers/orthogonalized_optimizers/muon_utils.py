@@ -159,7 +159,8 @@ def newton_schulz(
         transpose: Whether to transpose the tensor to perform whitening on the smaller dimension.
             If None, will be determined based on the size of the tensor.
         tp_group: The process group for communication if input is distributed.
-        use_syrk: Whether to use the Triton kernel for the Newton-Schulz iteration.
+        use_syrk: Whether to use Triton TSYRK Gram substeps under the medium
+            BF16 matmul path. This is not a fully fused Newton-Schulz kernel.
 
     Returns:
         The orthogonalization of x.

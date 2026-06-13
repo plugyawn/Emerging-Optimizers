@@ -4,9 +4,10 @@
 """Matrix update rules that consume affine wgrad factors.
 
 The public functions in this module consume only the ordinary affine weight
-gradient ``G = dY.T @ X`` and optional feature Gram ``C = X.T @ X``. They do
-not require raw activations, LocoProp targets, output-feature crosses, or the
-current logical weight as an operand for the update direction.
+gradient ``G = dY.T @ X`` plus optional input-side feature Gram ``C = X.T @ X``
+and/or output-side grad Gram ``R = dY.T @ dY``. They do not require raw
+activations, LocoProp targets, output-feature crosses, or the current logical
+weight as an operand for the update direction.
 """
 
 from __future__ import annotations
