@@ -6,6 +6,11 @@
 The public helpers always provide a PyTorch fallback. CUDA/Triton users get a
 single-kernel diagonal Gram reduction and single-kernel diagonal left/right
 preconditioned parameter updates.
+
+This module deliberately owns diagonal hot paths only. Dense and block-diagonal
+FEATURE_GRAM/GRAD_GRAM right/left solves remain in matrix_update_rules.py as
+factorized torch.linalg/cuBLAS-backed paths so callers do not mistake this file
+for generic Gram-solve acceleration.
 """
 
 from __future__ import annotations
