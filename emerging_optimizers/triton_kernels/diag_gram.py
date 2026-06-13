@@ -457,6 +457,16 @@ def diag_grad_gram_reduce(
     )
 
 
+def _validate_positive_diagonal(
+    diagonal: torch.Tensor,
+    *,
+    ridge: float,
+    message: str,
+) -> None:
+    if torch.any(diagonal.to(torch.float32) + ridge <= 0):
+        raise ValueError(message)
+
+
 def diag_right_precondition_matrix(
     grad: torch.Tensor,
     diag_feature_gram: torch.Tensor,
@@ -481,6 +491,11 @@ def diag_right_precondition_matrix(
         raise ValueError("diag_feature_gram length must match the gradient feature dimension")
     if weight_decay != 0.0 and not decoupled_weight_decay and param is None:
         raise ValueError("param is required for coupled weight decay")
+    _validate_positive_diagonal(
+        diag_feature_gram,
+        ridge=ridge,
+        message="Diagonal feature_gram entries must be positive after ridge regularization.",
+    )
 
     out = torch.empty(grad.shape, device=grad.device, dtype=torch.float32)
     if not HAS_TRITON_DIAG_GRAM or not (grad.is_cuda and diag_feature_gram.is_cuda):
@@ -552,6 +567,11 @@ def diag_left_precondition_matrix(
         raise ValueError("diag_grad_gram length must match the gradient output dimension")
     if weight_decay != 0.0 and not decoupled_weight_decay and param is None:
         raise ValueError("param is required for coupled weight decay")
+    _validate_positive_diagonal(
+        diag_grad_gram,
+        ridge=ridge,
+        message="Diagonal grad_gram entries must be positive after ridge regularization.",
+    )
 
     out = torch.empty(grad.shape, device=grad.device, dtype=torch.float32)
     if not HAS_TRITON_DIAG_GRAM or not (grad.is_cuda and diag_grad_gram.is_cuda):
@@ -664,6 +684,11 @@ def apply_diag_left_preconditioned_update_kernel_(
         raise ValueError("diag_grad_gram must be one-dimensional")
     if diag_grad_gram.shape[0] != param.shape[-2]:
         raise ValueError("diag_grad_gram length must match the parameter output dimension")
+    _validate_positive_diagonal(
+        diag_grad_gram,
+        ridge=ridge,
+        message="Diagonal grad_gram entries must be positive after ridge regularization.",
+    )
     if not HAS_TRITON_DIAG_GRAM or not (param.is_cuda and grad.is_cuda and diag_grad_gram.is_cuda):
         if weight_decay != 0.0 and decoupled_weight_decay:
             param.mul_(1.0 - lr * weight_decay)
@@ -724,6 +749,11 @@ def apply_diag_right_preconditioned_update_kernel_(
         raise ValueError("diag_feature_gram must be one-dimensional")
     if diag_feature_gram.shape[0] != param.shape[-1]:
         raise ValueError("diag_feature_gram length must match the parameter feature dimension")
+    _validate_positive_diagonal(
+        diag_feature_gram,
+        ridge=ridge,
+        message="Diagonal feature_gram entries must be positive after ridge regularization.",
+    )
     if not HAS_TRITON_DIAG_GRAM or not (param.is_cuda and grad.is_cuda and diag_feature_gram.is_cuda):
         if weight_decay != 0.0 and decoupled_weight_decay:
             param.mul_(1.0 - lr * weight_decay)
@@ -794,6 +824,16 @@ def apply_diag_two_sided_preconditioned_update_kernel_(
         raise ValueError("diag_left length must match the parameter output dimension")
     if diag_right.shape[0] != param.shape[-1]:
         raise ValueError("diag_right length must match the parameter feature dimension")
+    _validate_positive_diagonal(
+        diag_left,
+        ridge=ridge_left,
+        message="Diagonal preconditioner entries must be positive after ridge regularization.",
+    )
+    _validate_positive_diagonal(
+        diag_right,
+        ridge=ridge_right,
+        message="Diagonal preconditioner entries must be positive after ridge regularization.",
+    )
     if not (
         HAS_TRITON_DIAG_GRAM
         and param.is_cuda
