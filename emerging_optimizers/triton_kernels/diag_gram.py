@@ -22,15 +22,15 @@ try:
     import triton
     import triton.language as tl
 
-    HAS_TRITON_FEATURE_GRAM = True
+    HAS_TRITON_DIAG_GRAM = True
 except ImportError:  # pragma: no cover - depends on optional Triton install.
     triton = None
     tl = None
-    HAS_TRITON_FEATURE_GRAM = False
+    HAS_TRITON_DIAG_GRAM = False
 
 
 __all__ = [
-    "HAS_TRITON_FEATURE_GRAM",
+    "HAS_TRITON_DIAG_GRAM",
     "apply_diag_left_preconditioned_update_kernel_",
     "apply_diag_right_preconditioned_update_kernel_",
     "apply_diag_two_sided_preconditioned_update_kernel_",
@@ -42,7 +42,7 @@ __all__ = [
 ]
 
 
-if HAS_TRITON_FEATURE_GRAM:
+if HAS_TRITON_DIAG_GRAM:
 
     @triton.jit
     def _diag_feature_gram_kernel(
@@ -396,7 +396,7 @@ def diag_feature_gram_reduce(
         accumulate = False
     if count is not None:
         count.fill_(float(x.shape[0]))
-    if not HAS_TRITON_FEATURE_GRAM or not x.is_cuda:
+    if not HAS_TRITON_DIAG_GRAM or not x.is_cuda:
         value = _diag_feature_gram_fallback(
             x, mean=mean, ridge=ridge, reciprocal=reciprocal
         ).to(out.dtype)
@@ -483,7 +483,7 @@ def diag_right_precondition_matrix(
         raise ValueError("param is required for coupled weight decay")
 
     out = torch.empty(grad.shape, device=grad.device, dtype=torch.float32)
-    if not HAS_TRITON_FEATURE_GRAM or not (grad.is_cuda and diag_feature_gram.is_cuda):
+    if not HAS_TRITON_DIAG_GRAM or not (grad.is_cuda and diag_feature_gram.is_cuda):
         update_grad = grad.to(torch.float32)
         if weight_decay != 0.0 and not decoupled_weight_decay:
             update_grad = update_grad + param.to(torch.float32) * weight_decay
@@ -554,7 +554,7 @@ def diag_left_precondition_matrix(
         raise ValueError("param is required for coupled weight decay")
 
     out = torch.empty(grad.shape, device=grad.device, dtype=torch.float32)
-    if not HAS_TRITON_FEATURE_GRAM or not (grad.is_cuda and diag_grad_gram.is_cuda):
+    if not HAS_TRITON_DIAG_GRAM or not (grad.is_cuda and diag_grad_gram.is_cuda):
         update_grad = grad.to(torch.float32)
         if weight_decay != 0.0 and not decoupled_weight_decay:
             update_grad = update_grad + param.to(torch.float32) * weight_decay
@@ -614,7 +614,7 @@ def apply_matrix_update_kernel_(
         raise ValueError("param and update must be two-dimensional")
     if param.shape != update.shape:
         raise ValueError("param and update must have matching shapes")
-    if not HAS_TRITON_FEATURE_GRAM or not (param.is_cuda and update.is_cuda):
+    if not HAS_TRITON_DIAG_GRAM or not (param.is_cuda and update.is_cuda):
         if weight_decay != 0.0 and decoupled_weight_decay:
             param.mul_(1.0 - lr * weight_decay)
         param.add_(update.to(param.dtype), alpha=-lr * update_scale)
@@ -664,7 +664,7 @@ def apply_diag_left_preconditioned_update_kernel_(
         raise ValueError("diag_grad_gram must be one-dimensional")
     if diag_grad_gram.shape[0] != param.shape[-2]:
         raise ValueError("diag_grad_gram length must match the parameter output dimension")
-    if not HAS_TRITON_FEATURE_GRAM or not (param.is_cuda and grad.is_cuda and diag_grad_gram.is_cuda):
+    if not HAS_TRITON_DIAG_GRAM or not (param.is_cuda and grad.is_cuda and diag_grad_gram.is_cuda):
         if weight_decay != 0.0 and decoupled_weight_decay:
             param.mul_(1.0 - lr * weight_decay)
         update_grad = grad
@@ -724,7 +724,7 @@ def apply_diag_right_preconditioned_update_kernel_(
         raise ValueError("diag_feature_gram must be one-dimensional")
     if diag_feature_gram.shape[0] != param.shape[-1]:
         raise ValueError("diag_feature_gram length must match the parameter feature dimension")
-    if not HAS_TRITON_FEATURE_GRAM or not (param.is_cuda and grad.is_cuda and diag_feature_gram.is_cuda):
+    if not HAS_TRITON_DIAG_GRAM or not (param.is_cuda and grad.is_cuda and diag_feature_gram.is_cuda):
         if weight_decay != 0.0 and decoupled_weight_decay:
             param.mul_(1.0 - lr * weight_decay)
         update_grad = grad
@@ -795,7 +795,7 @@ def apply_diag_two_sided_preconditioned_update_kernel_(
     if diag_right.shape[0] != param.shape[-1]:
         raise ValueError("diag_right length must match the parameter feature dimension")
     if not (
-        HAS_TRITON_FEATURE_GRAM
+        HAS_TRITON_DIAG_GRAM
         and param.is_cuda
         and grad.is_cuda
         and diag_left.is_cuda

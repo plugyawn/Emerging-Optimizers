@@ -18,6 +18,6 @@ except ImportError:
     HAS_TRITON_340 = False
 
 try:
-    from .feature_gram import *
+    from .diag_gram import *
 except ImportError:
     pass

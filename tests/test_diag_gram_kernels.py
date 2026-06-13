@@ -4,8 +4,8 @@
 import torch
 from absl.testing import absltest
 
-from emerging_optimizers.triton_kernels.feature_gram import (
-    HAS_TRITON_FEATURE_GRAM,
+from emerging_optimizers.triton_kernels.diag_gram import (
+    HAS_TRITON_DIAG_GRAM,
     apply_diag_left_preconditioned_update_kernel_,
     apply_diag_right_preconditioned_update_kernel_,
     apply_diag_two_sided_preconditioned_update_kernel_,
@@ -19,7 +19,7 @@ class FeatureGramKernelFallbackTest(absltest.TestCase):
     def _cuda_or_skip(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
-        if not HAS_TRITON_FEATURE_GRAM:
+        if not HAS_TRITON_DIAG_GRAM:
             self.skipTest("Triton not available")
         return torch.device("cuda")
 

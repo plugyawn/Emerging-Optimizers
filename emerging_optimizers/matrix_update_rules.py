@@ -503,7 +503,7 @@ def apply_diag_newton_muon_update_(
     if diag_feature_gram.shape[0] != grad.shape[-1]:
         raise ValueError("diag_feature_gram length must match the parameter feature dimension")
 
-    from emerging_optimizers.triton_kernels.feature_gram import (
+    from emerging_optimizers.triton_kernels.diag_gram import (
         apply_matrix_update_kernel_,
         diag_right_precondition_matrix,
     )
@@ -527,21 +527,14 @@ def apply_diag_newton_muon_update_(
         )
 
     scale = _muon_scale_factor(grad.size(-2), grad.size(-1), scale_mode) * extra_scale_factor
-    if param.is_cuda and orthogonalized.is_cuda:
-        apply_matrix_update_kernel_(
-            param,
-            orthogonalized,
-            lr=lr,
-            update_scale=scale,
-            weight_decay=weight_decay,
-            decoupled_weight_decay=decoupled_weight_decay,
-        )
-        return param
-
-    if weight_decay != 0.0 and decoupled_weight_decay:
-        param.mul_(1.0 - lr * weight_decay)
-    param.add_(orthogonalized.to(param.dtype), alpha=-lr * scale)
-    return param
+    return apply_matrix_update_kernel_(
+        param,
+        orthogonalized,
+        lr=lr,
+        update_scale=scale,
+        weight_decay=weight_decay,
+        decoupled_weight_decay=decoupled_weight_decay,
+    )
 
 
 def apply_diag_right_preconditioned_update_(
@@ -565,31 +558,20 @@ def apply_diag_right_preconditioned_update_(
 
     if diag_feature_gram.ndim != 1:
         raise ValueError("diag_feature_gram must be one-dimensional")
-    if param.is_cuda and grad.is_cuda and diag_feature_gram.is_cuda:
-        from emerging_optimizers.triton_kernels.feature_gram import (
-            apply_diag_right_preconditioned_update_kernel_,
-        )
+    from emerging_optimizers.triton_kernels.diag_gram import (
+        apply_diag_right_preconditioned_update_kernel_,
+    )
 
-        return apply_diag_right_preconditioned_update_kernel_(
-            param,
-            grad,
-            diag_feature_gram,
-            lr=lr,
-            ridge=ridge,
-            update_scale=update_scale,
-            weight_decay=weight_decay,
-            decoupled_weight_decay=decoupled_weight_decay,
-        )
-    if weight_decay != 0.0 and decoupled_weight_decay:
-        param.mul_(1.0 - lr * weight_decay)
-    update_grad = grad
-    if weight_decay != 0.0 and not decoupled_weight_decay:
-        update_grad = grad.add(param, alpha=weight_decay)
-    denom = diag_feature_gram.to(update_grad.dtype) + ridge
-    if torch.any(denom <= 0):
-        raise ValueError("Diagonal feature_gram entries must be positive after ridge regularization.")
-    param.add_(update_grad / denom, alpha=-lr * update_scale)
-    return param
+    return apply_diag_right_preconditioned_update_kernel_(
+        param,
+        grad,
+        diag_feature_gram,
+        lr=lr,
+        ridge=ridge,
+        update_scale=update_scale,
+        weight_decay=weight_decay,
+        decoupled_weight_decay=decoupled_weight_decay,
+    )
 
 
 def apply_diag_left_preconditioned_update_(
@@ -613,31 +595,20 @@ def apply_diag_left_preconditioned_update_(
 
     if diag_grad_gram.ndim != 1:
         raise ValueError("diag_grad_gram must be one-dimensional")
-    if param.is_cuda and grad.is_cuda and diag_grad_gram.is_cuda:
-        from emerging_optimizers.triton_kernels.feature_gram import (
-            apply_diag_left_preconditioned_update_kernel_,
-        )
+    from emerging_optimizers.triton_kernels.diag_gram import (
+        apply_diag_left_preconditioned_update_kernel_,
+    )
 
-        return apply_diag_left_preconditioned_update_kernel_(
-            param,
-            grad,
-            diag_grad_gram,
-            lr=lr,
-            ridge=ridge,
-            update_scale=update_scale,
-            weight_decay=weight_decay,
-            decoupled_weight_decay=decoupled_weight_decay,
-        )
-    if weight_decay != 0.0 and decoupled_weight_decay:
-        param.mul_(1.0 - lr * weight_decay)
-    update_grad = grad
-    if weight_decay != 0.0 and not decoupled_weight_decay:
-        update_grad = grad.add(param, alpha=weight_decay)
-    denom = diag_grad_gram.to(update_grad.dtype) + ridge
-    if torch.any(denom <= 0):
-        raise ValueError("Diagonal grad_gram entries must be positive after ridge regularization.")
-    param.add_(update_grad / denom[:, None], alpha=-lr * update_scale)
-    return param
+    return apply_diag_left_preconditioned_update_kernel_(
+        param,
+        grad,
+        diag_grad_gram,
+        lr=lr,
+        ridge=ridge,
+        update_scale=update_scale,
+        weight_decay=weight_decay,
+        decoupled_weight_decay=decoupled_weight_decay,
+    )
 
 
 def apply_diag_two_sided_preconditioned_update_(
@@ -663,39 +634,22 @@ def apply_diag_two_sided_preconditioned_update_(
 
     if diag_left.ndim != 1 or diag_right.ndim != 1:
         raise ValueError("diag_left and diag_right must be one-dimensional")
-    if param.is_cuda and grad.is_cuda and diag_left.is_cuda and diag_right.is_cuda:
-        from emerging_optimizers.triton_kernels.feature_gram import (
-            apply_diag_two_sided_preconditioned_update_kernel_,
-        )
-
-        return apply_diag_two_sided_preconditioned_update_kernel_(
-            param,
-            grad,
-            diag_left,
-            diag_right,
-            lr=lr,
-            ridge_left=ridge_left,
-            ridge_right=ridge_right,
-            update_scale=update_scale,
-            weight_decay=weight_decay,
-            decoupled_weight_decay=decoupled_weight_decay,
-        )
-    if weight_decay != 0.0 and decoupled_weight_decay:
-        param.mul_(1.0 - lr * weight_decay)
-    update_grad = grad
-    if weight_decay != 0.0 and not decoupled_weight_decay:
-        update_grad = grad.add(param, alpha=weight_decay)
-    denom_left = diag_left.to(update_grad.dtype) + ridge_left
-    denom_right = diag_right.to(update_grad.dtype) + ridge_right
-    if torch.any(denom_left <= 0) or torch.any(denom_right <= 0):
-        raise ValueError(
-            "Diagonal preconditioner entries must be positive after ridge regularization."
-        )
-    param.add_(
-        update_grad / (denom_left[:, None] * denom_right[None, :]),
-        alpha=-lr * update_scale,
+    from emerging_optimizers.triton_kernels.diag_gram import (
+        apply_diag_two_sided_preconditioned_update_kernel_,
     )
-    return param
+
+    return apply_diag_two_sided_preconditioned_update_kernel_(
+        param,
+        grad,
+        diag_left,
+        diag_right,
+        lr=lr,
+        ridge_left=ridge_left,
+        ridge_right=ridge_right,
+        update_scale=update_scale,
+        weight_decay=weight_decay,
+        decoupled_weight_decay=decoupled_weight_decay,
+    )
 
 
 def newton_schulz_orthogonalize_grouped(
