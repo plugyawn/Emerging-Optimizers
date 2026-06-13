@@ -259,14 +259,6 @@ class FeatureGramFactorization:
         raise RuntimeError(f"Unsupported FeatureGramFactorization kind: {self.kind}")
 
 
-def _right_solve_dense_spd(grad: torch.Tensor, gram: torch.Tensor) -> torch.Tensor:
-    """Solve ``out @ gram = grad`` with a Cholesky fast path."""
-
-    return FeatureGramFactorization(
-        "dense_cholesky", torch.linalg.cholesky(gram)
-    ).right_solve(grad)
-
-
 def _pad_feature_axis(tensor: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int]:
     feature_dim = tensor.shape[-1]
     padded_dim = ((feature_dim + block_size - 1) // block_size) * block_size
@@ -302,12 +294,6 @@ def _right_solve_block_diag_from_factor(
         solved = torch.linalg.solve(block_factor, grad_blocks)
     out = solved.permute(2, 0, 1).reshape(q, expected_features)
     return out[..., :feature_dim]
-
-
-def _right_solve_block_diag_spd(grad: torch.Tensor, block_gram: torch.Tensor) -> torch.Tensor:
-    """Solve ``out @ block_diag(block_gram) = grad`` with a batched Cholesky fast path."""
-
-    return factorize_feature_gram(block_gram).right_solve(grad)
 
 
 def _right_multiply_block_diag(grad: torch.Tensor, block_matrix: torch.Tensor) -> torch.Tensor:
