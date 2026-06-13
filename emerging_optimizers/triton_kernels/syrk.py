@@ -32,6 +32,17 @@ except ImportError:
 __all__ = ["tsyrk_ex", "tsyrk_ex_small_matrix", "HAS_TRITON_340"]
 
 
+_TSYRK_EX_WARMED: set[tuple] = set()
+_TSYRK_EX_SMALL_MATRIX_WARMED: set[tuple] = set()
+
+
+def _should_run_warm_launch(cache: set[tuple], key: tuple) -> bool:
+    if key in cache:
+        return False
+    cache.add(key)
+    return True
+
+
 def prune_invalid_configs(configs: list[triton.Config], named_args: dict, **kwargs) -> list[triton.Config]:
     """Prune invalid Triton kernel configs based on input size and tile parameters.
 
@@ -391,6 +402,33 @@ def tsyrk_ex(
     def grid(META):
         return (triton.cdiv(N, META["TILE_M"]) * triton.cdiv(N, META["TILE_N"]),)
 
+    warm_key = (
+        a.device.type,
+        a.device.index,
+        N,
+        K,
+        bool(is_trans),
+        bool(c_desc is not None),
+        float(alpha),
+        float(beta),
+        bool(skip_upper_triangle),
+    )
+    if _should_run_warm_launch(_TSYRK_EX_WARMED, warm_key):
+        syrk_kernel_bf16[grid](
+            d_desc,
+            d_t_desc,
+            a_desc,
+            a_t_desc,
+            c_desc,
+            alpha,
+            beta,
+            skip_upper_triangle,
+            is_trans,
+            N,
+            K,
+            WARP_SPECIALIZE=False,
+        )
+
     syrk_kernel_bf16[grid](
         d_desc,
         d_t_desc,
@@ -482,6 +520,33 @@ def tsyrk_ex_small_matrix(
         assert META["TILE_M"] == META["TILE_N"], "syrk_kernel_bf16_opt requires square tiles."
         B = triton.cdiv(N, META["TILE_M"])
         return (B * (B + 1) // 2,)
+
+    warm_key = (
+        a.device.type,
+        a.device.index,
+        N,
+        K,
+        bool(is_trans),
+        bool(c_desc is not None),
+        float(alpha),
+        float(beta),
+        bool(skip_upper_triangle),
+    )
+    if _should_run_warm_launch(_TSYRK_EX_SMALL_MATRIX_WARMED, warm_key):
+        syrk_kernel_bf16_for_small_matrix[grid](
+            d_desc,
+            d_t_desc,
+            a_desc,
+            a_t_desc,
+            c_desc,
+            alpha,
+            beta,
+            skip_upper_triangle,
+            is_trans,
+            N,
+            K,
+            WARP_SPECIALIZE=False,
+        )
 
     syrk_kernel_bf16_for_small_matrix[grid](
         d_desc,

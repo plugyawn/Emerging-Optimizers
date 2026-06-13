@@ -42,13 +42,9 @@ class TsyrkTest(parameterized.TestCase):
     )
     def test_tsyrk_ex_close_to_matmul(self, n: int, k: int, atol: float, rtol: float, trans: bool):
         a = torch.randn(n, k, device=self.device, dtype=torch.bfloat16)
-        a_warmup = torch.randn_like(a, device=a.device, dtype=torch.bfloat16)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
         ref = a @ a.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex(a_warmup)
         c = triton_kernels.tsyrk_ex(a)
         torch.testing.assert_close(c, ref, atol=atol, rtol=rtol)
 
@@ -58,13 +54,9 @@ class TsyrkTest(parameterized.TestCase):
     )
     def test_tsyrk_ex_small_matrix_close_to_matmul(self, n: int, k: int, atol: float, rtol: float, trans: bool):
         a = torch.randn(n, k, device=self.device, dtype=torch.bfloat16)
-        a_warmup = torch.randn_like(a, device=a.device, dtype=torch.bfloat16)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
         ref = a @ a.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex_small_matrix(a_warmup)
         c = triton_kernels.tsyrk_ex_small_matrix(a)
         torch.testing.assert_close(c, ref, atol=atol, rtol=rtol)
 
@@ -76,13 +68,9 @@ class TsyrkTest(parameterized.TestCase):
         a = torch.randn(n, n, device=self.device, dtype=torch.bfloat16)
         # make a symmetric input matrix
         a = a + a.T
-        a_warmup = torch.randn_like(a, device=a.device, dtype=torch.bfloat16)
         ref = torch.addmm(a, a, a, alpha=alpha, beta=beta)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex(a_warmup, a_warmup, alpha=alpha, beta=beta)
         c = triton_kernels.tsyrk_ex(a, a, alpha=alpha, beta=beta)
         torch.testing.assert_close(c, ref, atol=0, rtol=rtol)
 
@@ -94,13 +82,9 @@ class TsyrkTest(parameterized.TestCase):
         a = torch.randn(n, n, device=self.device, dtype=torch.bfloat16)
         # make a symmetric input matrix.
         a = a + a.T
-        a_warmup = torch.randn_like(a, device=a.device, dtype=torch.bfloat16)
         ref = torch.addmm(a, a, a, alpha=alpha, beta=beta)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex_small_matrix(a_warmup, a_warmup, alpha=alpha, beta=beta)
         c = triton_kernels.tsyrk_ex_small_matrix(a, a, alpha=alpha, beta=beta)
         torch.testing.assert_close(c, ref, atol=0, rtol=rtol)
 
@@ -128,13 +112,9 @@ class TsyrkIntegerInputTest(parameterized.TestCase):
     )
     def test_tsyrk_ex_match_matmul(self, n: int, k: int, trans: bool):
         a = torch.randint(-3, 3, (n, k), device=self.device, dtype=torch.bfloat16)
-        a_warmup = torch.randint_like(a, -3, 3, device=a.device, dtype=torch.bfloat16)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
         ref = a @ a.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex(a_warmup)
         c = triton_kernels.tsyrk_ex(a)
         torch.testing.assert_close(c, ref, atol=0, rtol=0)
 
@@ -144,13 +124,9 @@ class TsyrkIntegerInputTest(parameterized.TestCase):
     )
     def test_tsyrk_ex_small_matrix_match_matmul(self, n: int, k: int, trans: bool):
         a = torch.randint(-3, 3, (n, k), device=self.device, dtype=torch.bfloat16)
-        a_warmup = torch.randint_like(a, -3, 3, device=a.device, dtype=torch.bfloat16)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
         ref = a @ a.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex_small_matrix(a_warmup)
         c = triton_kernels.tsyrk_ex_small_matrix(a)
         torch.testing.assert_close(c, ref, atol=0, rtol=0)
 
@@ -162,13 +138,9 @@ class TsyrkIntegerInputTest(parameterized.TestCase):
         a = torch.randint(-3, 3, (n, n), device=self.device, dtype=torch.bfloat16)
         # make a symmetric input matrix.
         a = a + a.T
-        a_warmup = torch.randint_like(a, -3, 3, device=a.device, dtype=torch.bfloat16)
         ref = torch.addmm(a, a, a, alpha=alpha, beta=beta)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex(a_warmup, a_warmup, alpha=alpha, beta=beta)
         c = triton_kernels.tsyrk_ex(a, a, alpha=alpha, beta=beta)
         torch.testing.assert_close(c, ref, atol=0, rtol=0)
 
@@ -180,13 +152,9 @@ class TsyrkIntegerInputTest(parameterized.TestCase):
         a = torch.randint(-3, 3, (n, n), device=self.device, dtype=torch.bfloat16)
         # make a symmetric input matrix.
         a = a + a.T
-        a_warmup = torch.randint_like(a, -3, 3, device=a.device, dtype=torch.bfloat16)
         ref = torch.addmm(a, a, a, alpha=alpha, beta=beta)
         if trans:
             a = a.T
-            a_warmup = a_warmup.T
-        # warmup the triton kernel to avoid the wrong result from the first run.
-        _ = triton_kernels.tsyrk_ex_small_matrix(a_warmup, a_warmup, alpha=alpha, beta=beta)
         c = triton_kernels.tsyrk_ex_small_matrix(a, a, alpha=alpha, beta=beta)
         torch.testing.assert_close(c, ref, atol=0, rtol=0)
 
