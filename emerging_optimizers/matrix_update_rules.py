@@ -487,11 +487,11 @@ def apply_diag_newton_muon_update_(
 ) -> torch.Tensor:
     """Apply the diagonal Newton-Muon update in-place.
 
-    This is the end-to-end diagonal FEATURE_GRAM path:
-    ``grad / (diag(C) + ridge)`` is materialized directly as the Newton-Schulz
-    operand, Polar Express/NS uses the shared Muon implementation, and the
-    scaled parameter update is applied in-place. Dense and block-diagonal
-    FEATURE_GRAM variants intentionally stay on the generic solve path.
+    This is the fast diagonal FEATURE_GRAM Newton-Muon path:
+    diagonal right preconditioning feeds the shared Polar Express/NS Muon
+    implementation, and the scaled parameter update is applied in-place. Dense
+    and block-diagonal FEATURE_GRAM variants intentionally stay on the generic
+    solve path.
     """
 
     if param.ndim != 2 or grad.ndim != 2:

@@ -57,7 +57,8 @@ class AdaptiveMuon(muon.Muon):
         num_ns_steps: The number of iteration steps to use in the Newton-Schulz iteration.
         scale_mode: The type of scale factor to use for the update.
         extra_scale_factor: The additional scale factor to use for the update.
-        use_syrk: Whether to use the Triton kernel for the Newton-Schulz iteration.
+        use_syrk: Whether to use Triton TSYRK-backed Newton-Schulz Gram substeps
+            on supported Triton/SM combinations.
         moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
         beta2: The exponential decay rate for second moment.
         eps: Small constant for numerical stability.

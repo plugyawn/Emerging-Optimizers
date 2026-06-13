@@ -68,7 +68,8 @@ class Muon(OrthogonalizedOptimizer):
         scale_mode: The type of scale factor to use for the update. Defaults to "spectral" style scaling.
         extra_scale_factor: The additional scale factor to use for the update. Setting it to 0.2 can closely match
             the update RMS norm of AdamW as suggested by https://arxiv.org/abs/2502.16982.
-        use_syrk: Whether to use the Triton kernel for the Newton-Schulz iteration.
+        use_syrk: Whether to use Triton TSYRK-backed Newton-Schulz Gram substeps
+            on supported Triton/SM combinations.
     """
 
     def __init__(

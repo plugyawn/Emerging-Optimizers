@@ -15,11 +15,11 @@ A more advanced version breaks down operations and overlaps communication with c
 
 ## Emerging optimizers
 
-There are many emerging optimizers that require gradient of the entire layer to calculate update to each individual weight. For example, the popular Muon optimizer does:
+There are many emerging optimizers that require non-elementwise matrix context to calculate updates. For example, the popular Muon optimizer does:
 
 <img src="https://kellerjordan.github.io/images/muon/muon_algo.png" alt="Muon" width="400" />
 
-If weights and optimizer states are evenly distributed among DP ranks, update can't be calculated based on the data available on each GPU. Additional communication will be needed to collect data for calculating the full update.
+If weights and optimizer states are evenly distributed among DP ranks with ordinary elementwise flat sharding, the update can't be calculated based on the data available on each GPU. Additional matrix-aware communication or layout constraints are needed; supported row/column matrix shards can use small-Gram collectives instead of gathering the full logical matrix.
 
 ## Layer-wise sharding
 

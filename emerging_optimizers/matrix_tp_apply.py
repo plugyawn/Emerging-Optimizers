@@ -334,9 +334,10 @@ def tp_small_gram_newton_schulz_allreduce(
     ``row_parallel`` weights are column-sharded, so the exact small Gram is
     ``sum_i M_i @ M_i.T`` and each rank applies the left factor locally.
 
-    This helper is intended as the semantic/reference path for matrix-aware
-    FSDP and TP parity tests. It uses PyTorch matmul/addmm so CUDA execution is
-    backed by cuBLAS/cuBLASLt, while avoiding full-matrix all-gather.
+    This helper is intended as the semantic/reference path for TP parity tests
+    and future matrix-axis-aware DP/FSDP experiments. It is not wired to
+    Megatron-FSDP. It uses PyTorch matmul/addmm so CUDA execution is backed by
+    cuBLAS/cuBLASLt, while avoiding full-matrix all-gather.
     """
 
     _require_2d_matrix(local_matrix, "local_matrix")
