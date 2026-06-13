@@ -14,7 +14,7 @@
 # limitations under the License.
 from functools import partial
 from inspect import signature
-from typing import Any, Callable, Concatenate
+from typing import Any, Callable
 
 from absl import logging
 from torch import optim
@@ -85,7 +85,7 @@ def validate_optimizer_args(opt_cls: type, kwargs: dict[str, Any]) -> None:
         )
 
 
-def get_configured_optimizer_cls(name: str, **kwargs: Any) -> Callable[Concatenate[ParamsT, ...], optim.Optimizer]:
+def get_configured_optimizer_cls(name: str, **kwargs: Any) -> Callable[..., optim.Optimizer]:
     """Returns a callable that creates an optimizer with the given arguments."""
     opt_cls = get_optimizer_cls(name)
     validate_optimizer_args(opt_cls, kwargs)

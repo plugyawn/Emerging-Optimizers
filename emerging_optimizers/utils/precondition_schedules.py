@@ -14,7 +14,7 @@
 # limitations under the License.
 import math
 from abc import ABC, abstractmethod
-from typing import override
+from typing_extensions import override
 
 
 __all__ = [
