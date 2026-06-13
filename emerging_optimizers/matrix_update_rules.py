@@ -30,6 +30,7 @@ __all__ = [
     "NSCoeffT",
     "MuonScaleT",
     "apply_diag_newton_muon_update_",
+    "apply_diag_left_preconditioned_update_",
     "apply_diag_right_preconditioned_update_",
     "block_diag_feature_gram_to_dense",
     "dense_feature_gram_to_block_diag",
@@ -600,6 +601,54 @@ def apply_diag_right_preconditioned_update_(
     if torch.any(denom <= 0):
         raise ValueError("Diagonal feature_gram entries must be positive after ridge regularization.")
     param.add_(update_grad / denom, alpha=-lr * update_scale)
+    return param
+
+
+def apply_diag_left_preconditioned_update_(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    diag_grad_gram: torch.Tensor,
+    *,
+    lr: float,
+    ridge: float = 0.0,
+    update_scale: float = 1.0,
+    weight_decay: float = 0.0,
+    decoupled_weight_decay: bool = True,
+) -> torch.Tensor:
+    """Apply a diagonal left-preconditioned update in-place.
+
+    This is the output-side analogue of diagonal FEATURE_GRAM right
+    preconditioning: optional weight decay, ``diag(dY.T @ dY)`` row scaling,
+    update scale, learning rate, and parameter add are performed without
+    materializing a dense output Gram.
+    """
+
+    if diag_grad_gram.ndim != 1:
+        raise ValueError("diag_grad_gram must be one-dimensional")
+    if param.is_cuda and grad.is_cuda and diag_grad_gram.is_cuda:
+        from emerging_optimizers.triton_kernels.feature_gram import (
+            apply_diag_left_preconditioned_update_kernel_,
+        )
+
+        return apply_diag_left_preconditioned_update_kernel_(
+            param,
+            grad,
+            diag_grad_gram,
+            lr=lr,
+            ridge=ridge,
+            update_scale=update_scale,
+            weight_decay=weight_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+        )
+    if weight_decay != 0.0 and decoupled_weight_decay:
+        param.mul_(1.0 - lr * weight_decay)
+    update_grad = grad
+    if weight_decay != 0.0 and not decoupled_weight_decay:
+        update_grad = grad.add(param, alpha=weight_decay)
+    denom = diag_grad_gram.to(update_grad.dtype) + ridge
+    if torch.any(denom <= 0):
+        raise ValueError("Diagonal grad_gram entries must be positive after ridge regularization.")
+    param.add_(update_grad / denom[:, None], alpha=-lr * update_scale)
     return param
 
 

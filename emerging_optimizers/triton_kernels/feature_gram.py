@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Optional Triton kernels for FEATURE_GRAM diagonal paths.
+"""Optional Triton kernels for diagonal matrix preconditioner paths.
 
 The public helpers always provide a PyTorch fallback. CUDA/Triton users get a
-single-kernel diagonal Gram reduction and a single-kernel diagonal
-right-preconditioned parameter update.
+single-kernel diagonal Gram reduction and single-kernel diagonal left/right
+preconditioned parameter updates.
 """
 
 from __future__ import annotations
@@ -26,8 +26,11 @@ except ImportError:  # pragma: no cover - depends on optional Triton install.
 
 __all__ = [
     "HAS_TRITON_FEATURE_GRAM",
+    "apply_diag_left_preconditioned_update_kernel_",
     "apply_diag_right_preconditioned_update_kernel_",
     "apply_matrix_update_kernel_",
+    "diag_grad_gram_reduce",
+    "diag_left_precondition_matrix",
     "diag_right_precondition_matrix",
     "diag_feature_gram_reduce",
 ]
@@ -119,6 +122,53 @@ if HAS_TRITON_FEATURE_GRAM:
         )
 
     @triton.jit
+    def _diag_left_update_kernel(
+        param,
+        grad,
+        diag,
+        rows: tl.constexpr,
+        cols: tl.constexpr,
+        p_stride_m: tl.constexpr,
+        p_stride_n: tl.constexpr,
+        g_stride_m: tl.constexpr,
+        g_stride_n: tl.constexpr,
+        lr: tl.constexpr,
+        ridge: tl.constexpr,
+        update_scale: tl.constexpr,
+        weight_decay: tl.constexpr,
+        decoupled_weight_decay: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_m = tl.program_id(axis=0)
+        pid_n = tl.program_id(axis=1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m[:, None] < rows) & (offs_n[None, :] < cols)
+        p = tl.load(
+            param + offs_m[:, None] * p_stride_m + offs_n[None, :] * p_stride_n,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        g = tl.load(
+            grad + offs_m[:, None] * g_stride_m + offs_n[None, :] * g_stride_n,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if weight_decay != 0.0:
+            if decoupled_weight_decay:
+                p = p * (1.0 - lr * weight_decay)
+            else:
+                g = g + weight_decay * p
+        denom = tl.load(diag + offs_m, mask=offs_m < rows, other=1.0).to(tl.float32) + ridge
+        p = p - lr * update_scale * g / denom[:, None]
+        tl.store(
+            param + offs_m[:, None] * p_stride_m + offs_n[None, :] * p_stride_n,
+            p,
+            mask=mask,
+        )
+
+    @triton.jit
     def _diag_right_precondition_kernel(
         param,
         grad,
@@ -159,6 +209,50 @@ if HAS_TRITON_FEATURE_GRAM:
         tl.store(
             out + offs_m[:, None] * o_stride_m + offs_n[None, :] * o_stride_n,
             g / denom[None, :],
+            mask=mask,
+        )
+
+    @triton.jit
+    def _diag_left_precondition_kernel(
+        param,
+        grad,
+        diag,
+        out,
+        rows: tl.constexpr,
+        cols: tl.constexpr,
+        p_stride_m: tl.constexpr,
+        p_stride_n: tl.constexpr,
+        g_stride_m: tl.constexpr,
+        g_stride_n: tl.constexpr,
+        o_stride_m: tl.constexpr,
+        o_stride_n: tl.constexpr,
+        ridge: tl.constexpr,
+        weight_decay: tl.constexpr,
+        decoupled_weight_decay: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_m = tl.program_id(axis=0)
+        pid_n = tl.program_id(axis=1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (offs_m[:, None] < rows) & (offs_n[None, :] < cols)
+        g = tl.load(
+            grad + offs_m[:, None] * g_stride_m + offs_n[None, :] * g_stride_n,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        if weight_decay != 0.0 and not decoupled_weight_decay:
+            p = tl.load(
+                param + offs_m[:, None] * p_stride_m + offs_n[None, :] * p_stride_n,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            g = g + weight_decay * p
+        denom = tl.load(diag + offs_m, mask=offs_m < rows, other=1.0).to(tl.float32) + ridge
+        tl.store(
+            out + offs_m[:, None] * o_stride_m + offs_n[None, :] * o_stride_n,
+            g / denom[:, None],
             mask=mask,
         )
 
@@ -272,6 +366,35 @@ def diag_feature_gram_reduce(
     return out
 
 
+def diag_grad_gram_reduce(
+    dy: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    count: torch.Tensor | None = None,
+    mean: bool = False,
+    ridge: float = 0.0,
+    reciprocal: bool = False,
+    accumulate: bool = False,
+) -> torch.Tensor:
+    """Compute diagonal ``dY.T @ dY`` with the same storage contract as FEATURE_GRAM.
+
+    This is intentionally a named wrapper around the diagonal Gram reducer:
+    token-major activations ``X`` and output gradients ``dY`` both reduce over
+    the token/sample dimension, but call sites should preserve whether the
+    result is input-side/right or output-side/left preconditioning metadata.
+    """
+
+    return diag_feature_gram_reduce(
+        dy,
+        out=out,
+        count=count,
+        mean=mean,
+        ridge=ridge,
+        reciprocal=reciprocal,
+        accumulate=accumulate,
+    )
+
+
 def diag_right_precondition_matrix(
     grad: torch.Tensor,
     diag_feature_gram: torch.Tensor,
@@ -343,6 +466,77 @@ def diag_right_precondition_matrix(
     return out
 
 
+def diag_left_precondition_matrix(
+    grad: torch.Tensor,
+    diag_grad_gram: torch.Tensor,
+    *,
+    param: torch.Tensor | None = None,
+    ridge: float = 0.0,
+    weight_decay: float = 0.0,
+    decoupled_weight_decay: bool = True,
+) -> torch.Tensor:
+    """Return ``diag(diag_grad_gram + ridge)^-1 @ grad`` as fp32.
+
+    If ``decoupled_weight_decay`` is false, the coupled L2 term is included
+    before preconditioning, matching the Megatron MatrixFunctionOptimizer
+    convention for generic update rules.
+    """
+
+    if grad.ndim != 2:
+        raise ValueError("grad must be two-dimensional")
+    if diag_grad_gram.ndim != 1:
+        raise ValueError("diag_grad_gram must be one-dimensional")
+    if diag_grad_gram.shape[0] != grad.shape[-2]:
+        raise ValueError("diag_grad_gram length must match the gradient output dimension")
+    if weight_decay != 0.0 and not decoupled_weight_decay and param is None:
+        raise ValueError("param is required for coupled weight decay")
+
+    out = torch.empty(grad.shape, device=grad.device, dtype=torch.float32)
+    if not HAS_TRITON_FEATURE_GRAM or not (grad.is_cuda and diag_grad_gram.is_cuda):
+        update_grad = grad.to(torch.float32)
+        if weight_decay != 0.0 and not decoupled_weight_decay:
+            update_grad = update_grad + param.to(torch.float32) * weight_decay
+        denom = diag_grad_gram.to(update_grad.dtype) + ridge
+        if torch.any(denom <= 0):
+            raise ValueError(
+                "Diagonal grad_gram entries must be positive after ridge regularization."
+            )
+        out.copy_(update_grad / denom[:, None])
+        return out
+
+    if weight_decay != 0.0 and not decoupled_weight_decay and not param.is_cuda:
+        raise ValueError("param must be CUDA when coupled weight decay is used on CUDA grad")
+    if param is None:
+        param = grad
+
+    block_m = 16
+    block_n = 64
+    grid = (
+        (grad.shape[0] + block_m - 1) // block_m,
+        (grad.shape[1] + block_n - 1) // block_n,
+    )
+    _diag_left_precondition_kernel[grid](
+        param,
+        grad,
+        diag_grad_gram,
+        out,
+        grad.shape[0],
+        grad.shape[1],
+        param.stride(0),
+        param.stride(1),
+        grad.stride(0),
+        grad.stride(1),
+        out.stride(0),
+        out.stride(1),
+        float(ridge),
+        float(weight_decay),
+        bool(decoupled_weight_decay),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+    )
+    return out
+
+
 def apply_matrix_update_kernel_(
     param: torch.Tensor,
     update: torch.Tensor,
@@ -380,6 +574,66 @@ def apply_matrix_update_kernel_(
         update.stride(0),
         update.stride(1),
         float(lr),
+        float(update_scale),
+        float(weight_decay),
+        bool(decoupled_weight_decay),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+    )
+    return param
+
+
+def apply_diag_left_preconditioned_update_kernel_(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    diag_grad_gram: torch.Tensor,
+    *,
+    lr: float,
+    ridge: float = 0.0,
+    update_scale: float = 1.0,
+    weight_decay: float = 0.0,
+    decoupled_weight_decay: bool = True,
+) -> torch.Tensor:
+    """Fused diagonal left-preconditioned parameter update with fallback."""
+
+    if param.ndim != 2 or grad.ndim != 2:
+        raise ValueError("param and grad must be two-dimensional")
+    if diag_grad_gram.ndim != 1:
+        raise ValueError("diag_grad_gram must be one-dimensional")
+    if diag_grad_gram.shape[0] != param.shape[-2]:
+        raise ValueError("diag_grad_gram length must match the parameter output dimension")
+    if not HAS_TRITON_FEATURE_GRAM or not (param.is_cuda and grad.is_cuda and diag_grad_gram.is_cuda):
+        if weight_decay != 0.0 and decoupled_weight_decay:
+            param.mul_(1.0 - lr * weight_decay)
+        update_grad = grad
+        if weight_decay != 0.0 and not decoupled_weight_decay:
+            update_grad = grad.add(param, alpha=weight_decay)
+        denom = diag_grad_gram.to(update_grad.dtype) + ridge
+        if torch.any(denom <= 0):
+            raise ValueError(
+                "Diagonal grad_gram entries must be positive after ridge regularization."
+            )
+        param.add_(update_grad / denom[:, None], alpha=-lr * update_scale)
+        return param
+
+    block_m = 16
+    block_n = 64
+    grid = (
+        (param.shape[0] + block_m - 1) // block_m,
+        (param.shape[1] + block_n - 1) // block_n,
+    )
+    _diag_left_update_kernel[grid](
+        param,
+        grad,
+        diag_grad_gram,
+        param.shape[0],
+        param.shape[1],
+        param.stride(0),
+        param.stride(1),
+        grad.stride(0),
+        grad.stride(1),
+        float(lr),
+        float(ridge),
         float(update_scale),
         float(weight_decay),
         bool(decoupled_weight_decay),

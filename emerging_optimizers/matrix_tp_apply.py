@@ -5,7 +5,7 @@
 
 These helpers are intentionally explicit about exactness. Local block application
 is exposed as an approximation; exact TP paths either all-gather the logical
-matrix or use the supported small-Gram polar all-reduce orientations.
+matrix or use the supported small-Gram polar all-reduce sides.
 """
 
 from __future__ import annotations
@@ -17,11 +17,18 @@ import torch
 from emerging_optimizers.matrix_update_rules import newton_schulz_orthogonalize
 
 TPLayout = Literal["none", "duplicated", "column_parallel", "row_parallel"]
+SmallGramSide = Literal["right", "left"]
+SmallGramOrientation = SmallGramSide
 
 __all__ = [
     "TPLayout",
+    "SmallGramSide",
+    "SmallGramOrientation",
     "allgather_logical_matrix",
     "shard_logical_matrix_like",
+    "small_gram_newton_schulz_side",
+    "small_gram_newton_schulz_orientation",
+    "tp_small_gram_newton_schulz_allreduce",
     "supports_small_gram_polar_allreduce",
     "tp_allgather_logical_matrix_update",
     "tp_block_local_approx",
@@ -143,13 +150,53 @@ def _matrix_inverse_sqrt_psd(matrix: torch.Tensor, *, eps: float = 0.0) -> torch
     return (evecs * inv_sqrt.unsqueeze(0)) @ evecs.mT
 
 
+def _matrix_inverse_sqrt_newton_schulz(
+    matrix: torch.Tensor,
+    *,
+    steps: int,
+    ridge: float = 1e-6,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Approximate ``matrix^-1/2`` using PyTorch/cuBLAS-backed Gram NS.
+
+    This is a reference-performance backend, not a fused kernel. It keeps the
+    iteration on the small symmetric Gram so row/column-sharded Muon can avoid
+    all-gathering the full logical matrix during the optimizer step.
+    """
+
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if ridge < 0.0:
+        raise ValueError("ridge must be >= 0")
+    if eps <= 0.0:
+        raise ValueError("eps must be > 0")
+    _require_2d_matrix(matrix, "matrix")
+    if matrix.shape[-1] != matrix.shape[-2]:
+        raise ValueError("matrix inverse square root requires a square matrix")
+
+    gram = matrix.to(torch.float32)
+    gram = 0.5 * (gram + gram.mT)
+    eye = torch.eye(gram.shape[-1], device=gram.device, dtype=gram.dtype)
+    if ridge != 0.0:
+        gram = gram + ridge * eye
+
+    scale = torch.linalg.matrix_norm(gram, ord="fro").clamp_min(eps)
+    y = gram / scale
+    z = eye
+    for _ in range(steps):
+        t = torch.addmm(3.0 * eye, z, y, beta=1.0, alpha=-1.0).mul_(0.5)
+        y = y @ t
+        z = t @ z
+    return z / torch.sqrt(scale)
+
+
 def supports_small_gram_polar_allreduce(
     local_matrix: torch.Tensor,
     *,
     tp_layout: TPLayout,
     group: torch.distributed.ProcessGroup | None = None,
 ) -> bool:
-    """Return whether the exact small-Gram polar all-reduce orientation is valid."""
+    """Return whether the exact small-Gram polar all-reduce side is valid."""
 
     _require_2d_matrix(local_matrix, "local_matrix")
     world_size = _dist_world_size(group)
@@ -165,6 +212,53 @@ def supports_small_gram_polar_allreduce(
     return False
 
 
+def small_gram_newton_schulz_side(
+    local_matrix: torch.Tensor,
+    *,
+    tp_layout: TPLayout,
+    group: torch.distributed.ProcessGroup | None = None,
+) -> SmallGramSide:
+    """Return the exact small-Gram NS side for this local matrix.
+
+    ``"right"`` means the exact Gram is ``M.T @ M`` and the update is
+    ``M @ G^{-1/2}``; ``"left"`` means the exact Gram is ``M @ M.T`` and the
+    update is ``G^{-1/2} @ M``. Distributed layouts must align with the matrix
+    axis opposite the small Gram.
+    """
+
+    _require_2d_matrix(local_matrix, "local_matrix")
+    world_size = _dist_world_size(group)
+    rows, cols = local_matrix.shape[-2:]
+    if world_size == 1 or tp_layout in ("none", "duplicated"):
+        return "right" if rows >= cols else "left"
+    if tp_layout == "column_parallel":
+        logical_rows = rows * world_size
+        if logical_rows < cols:
+            raise ValueError(
+                "small-Gram NS all-reduce for column_parallel requires a tall logical matrix."
+            )
+        return "right"
+    if tp_layout == "row_parallel":
+        logical_cols = cols * world_size
+        if logical_cols < rows:
+            raise ValueError(
+                "small-Gram NS all-reduce for row_parallel requires a wide logical matrix."
+            )
+        return "left"
+    raise ValueError(f"Unsupported TP layout: {tp_layout}")
+
+
+def small_gram_newton_schulz_orientation(
+    local_matrix: torch.Tensor,
+    *,
+    tp_layout: TPLayout,
+    group: torch.distributed.ProcessGroup | None = None,
+) -> SmallGramSide:
+    """Compatibility alias for ``small_gram_newton_schulz_side``."""
+
+    return small_gram_newton_schulz_side(local_matrix, tp_layout=tp_layout, group=group)
+
+
 def tp_small_gram_polar_allreduce(
     local_matrix: torch.Tensor,
     *,
@@ -172,7 +266,7 @@ def tp_small_gram_polar_allreduce(
     group: torch.distributed.ProcessGroup | None = None,
     eps: float = 0.0,
 ) -> torch.Tensor:
-    """Polar update for supported TP shard orientations.
+    """Polar update for supported TP shard sides.
 
     Supported exact cases:
     - ``column_parallel`` row shards where the logical matrix is tall, using
@@ -184,7 +278,7 @@ def tp_small_gram_polar_allreduce(
     a zero inverse on the Gram nullspace. Positive ``eps`` explicitly requests
     an epsilon-thresholded approximation.
 
-    Unsupported orientations must use the all-gather reference or an explicit
+    Unsupported sides must use the all-gather reference or an explicit
     block-local approximation.
     """
 
@@ -221,6 +315,58 @@ def tp_small_gram_polar_allreduce(
         gram = matrix @ matrix.mT
         torch.distributed.all_reduce(gram, op=torch.distributed.ReduceOp.SUM, group=group)
         return (_matrix_inverse_sqrt_psd(gram, eps=eps) @ matrix).to(torch.float32)
+
+    raise ValueError(f"Unsupported TP layout: {tp_layout}")
+
+
+def tp_small_gram_newton_schulz_allreduce(
+    local_matrix: torch.Tensor,
+    *,
+    tp_layout: TPLayout,
+    group: torch.distributed.ProcessGroup | None = None,
+    steps: int = 8,
+    ridge: float = 1e-6,
+) -> torch.Tensor:
+    """Reference row/column-sharded Muon update using all-reduced small Gram NS.
+
+    ``column_parallel`` weights are row-sharded, so the exact small Gram is
+    ``sum_i M_i.T @ M_i`` and each rank applies the right factor locally.
+    ``row_parallel`` weights are column-sharded, so the exact small Gram is
+    ``sum_i M_i @ M_i.T`` and each rank applies the left factor locally.
+
+    This helper is intended as the semantic/reference path for matrix-aware
+    FSDP and TP parity tests. It uses PyTorch matmul/addmm so CUDA execution is
+    backed by cuBLAS/cuBLASLt, while avoiding full-matrix all-gather.
+    """
+
+    _require_2d_matrix(local_matrix, "local_matrix")
+    world_size = _dist_world_size(group)
+    matrix = local_matrix.to(torch.float32)
+
+    side = small_gram_newton_schulz_side(
+        local_matrix, tp_layout=tp_layout, group=group
+    )
+
+    if world_size == 1 or tp_layout in ("none", "duplicated"):
+        if side == "right":
+            gram = matrix.mT @ matrix
+            factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
+            return (matrix @ factor).to(torch.float32)
+        gram = matrix @ matrix.mT
+        factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
+        return (factor @ matrix).to(torch.float32)
+
+    if tp_layout == "column_parallel":
+        gram = matrix.mT @ matrix
+        torch.distributed.all_reduce(gram, op=torch.distributed.ReduceOp.SUM, group=group)
+        factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
+        return (matrix @ factor).to(torch.float32)
+
+    if tp_layout == "row_parallel":
+        gram = matrix @ matrix.mT
+        torch.distributed.all_reduce(gram, op=torch.distributed.ReduceOp.SUM, group=group)
+        factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
+        return (factor @ matrix).to(torch.float32)
 
     raise ValueError(f"Unsupported TP layout: {tp_layout}")
 

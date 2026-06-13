@@ -6,6 +6,7 @@ from absl.testing import absltest
 
 from emerging_optimizers.matrix_update_rules import (
     apply_diag_newton_muon_update_,
+    apply_diag_left_preconditioned_update_,
     apply_diag_right_preconditioned_update_,
     block_diag_feature_gram_to_dense,
     dense_feature_gram_to_block_diag,
@@ -337,6 +338,25 @@ class MatrixUpdateRulesTest(absltest.TestCase):
         )
 
         expected = torch.ones(2, 3) * 0.98 - 0.05 * grad / (diag + 1.0)
+        torch.testing.assert_close(param, expected)
+
+    def test_apply_diag_left_preconditioned_update_inplace(self):
+        param = torch.ones(2, 3)
+        grad = torch.tensor([[2.0, 4.0, 6.0], [1.0, 2.0, 3.0]])
+        diag = torch.tensor([1.0, 3.0])
+
+        apply_diag_left_preconditioned_update_(
+            param,
+            grad,
+            diag,
+            lr=0.1,
+            ridge=1.0,
+            update_scale=0.5,
+            weight_decay=0.2,
+            decoupled_weight_decay=True,
+        )
+
+        expected = torch.ones(2, 3) * 0.98 - 0.05 * grad / (diag + 1.0)[:, None]
         torch.testing.assert_close(param, expected)
 
     def test_right_precondition_diag_feature_gram_rejects_singular_without_ridge(self):

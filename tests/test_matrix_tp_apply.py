@@ -12,6 +12,7 @@ from emerging_optimizers.matrix_tp_apply import (
     supports_small_gram_polar_allreduce,
     tp_allgather_logical_matrix_update,
     tp_block_local_approx,
+    tp_small_gram_newton_schulz_allreduce,
     tp_small_gram_polar_allreduce,
 )
 
@@ -213,6 +214,54 @@ class MatrixTPApplyTest(absltest.TestCase):
             with fake_distributed(world_size=2, rank=rank, all_reduce_value=gram):
                 update = tp_small_gram_polar_allreduce(local, tp_layout="row_parallel")
             torch.testing.assert_close(update, left_factor @ local)
+
+    def test_small_gram_ns_column_parallel_matches_full_reference(self):
+        shards = [
+            torch.tensor([[1.0, 0.25], [0.5, 2.0], [1.25, -0.5]]),
+            torch.tensor([[-0.75, 1.25], [2.0, -1.0], [0.5, 0.75]]),
+        ]
+        full = torch.cat(shards, dim=0)
+        full_update = tp_small_gram_newton_schulz_allreduce(
+            full,
+            tp_layout="none",
+            steps=12,
+            ridge=1e-5,
+        )
+        full_gram = full.mT @ full
+
+        for rank, local in enumerate(shards):
+            with fake_distributed(world_size=2, rank=rank, all_reduce_value=full_gram):
+                update = tp_small_gram_newton_schulz_allreduce(
+                    local,
+                    tp_layout="column_parallel",
+                    steps=12,
+                    ridge=1e-5,
+                )
+            torch.testing.assert_close(update, full_update.chunk(2, dim=0)[rank])
+
+    def test_small_gram_ns_row_parallel_matches_full_reference(self):
+        shards = [
+            torch.tensor([[1.0, 0.25, -0.5], [0.5, 2.0, 1.25]]),
+            torch.tensor([[-0.75, 1.25, 0.5], [2.0, -1.0, 0.75]]),
+        ]
+        full = torch.cat(shards, dim=1)
+        full_update = tp_small_gram_newton_schulz_allreduce(
+            full,
+            tp_layout="none",
+            steps=12,
+            ridge=1e-5,
+        )
+        full_gram = full @ full.mT
+
+        for rank, local in enumerate(shards):
+            with fake_distributed(world_size=2, rank=rank, all_reduce_value=full_gram):
+                update = tp_small_gram_newton_schulz_allreduce(
+                    local,
+                    tp_layout="row_parallel",
+                    steps=12,
+                    ridge=1e-5,
+                )
+            torch.testing.assert_close(update, full_update.chunk(2, dim=1)[rank])
 
     def test_small_gram_rejects_unsupported_column_orientation(self):
         local = torch.empty(1, 4)
