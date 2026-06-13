@@ -32,6 +32,7 @@ __all__ = [
     "apply_diag_newton_muon_update_",
     "apply_diag_left_preconditioned_update_",
     "apply_diag_right_preconditioned_update_",
+    "apply_diag_two_sided_preconditioned_update_",
     "block_diag_feature_gram_to_dense",
     "dense_feature_gram_to_block_diag",
     "diag_feature_gram_to_block_diag",
@@ -649,6 +650,64 @@ def apply_diag_left_preconditioned_update_(
     if torch.any(denom <= 0):
         raise ValueError("Diagonal grad_gram entries must be positive after ridge regularization.")
     param.add_(update_grad / denom[:, None], alpha=-lr * update_scale)
+    return param
+
+
+def apply_diag_two_sided_preconditioned_update_(
+    param: torch.Tensor,
+    grad: torch.Tensor,
+    diag_left: torch.Tensor,
+    diag_right: torch.Tensor,
+    *,
+    lr: float,
+    ridge_left: float = 0.0,
+    ridge_right: float = 0.0,
+    update_scale: float = 1.0,
+    weight_decay: float = 0.0,
+    decoupled_weight_decay: bool = True,
+) -> torch.Tensor:
+    """Apply a diagonal left-and-right-preconditioned update in-place.
+
+    This is the hot two-sided diagonal SGD path used when both output-side
+    ``grad_gram`` and input-side ``feature_gram`` preconditioners are active.
+    It avoids materializing the intermediate left-preconditioned direction and
+    avoids a second parameter-update kernel launch on CUDA.
+    """
+
+    if diag_left.ndim != 1 or diag_right.ndim != 1:
+        raise ValueError("diag_left and diag_right must be one-dimensional")
+    if param.is_cuda and grad.is_cuda and diag_left.is_cuda and diag_right.is_cuda:
+        from emerging_optimizers.triton_kernels.feature_gram import (
+            apply_diag_two_sided_preconditioned_update_kernel_,
+        )
+
+        return apply_diag_two_sided_preconditioned_update_kernel_(
+            param,
+            grad,
+            diag_left,
+            diag_right,
+            lr=lr,
+            ridge_left=ridge_left,
+            ridge_right=ridge_right,
+            update_scale=update_scale,
+            weight_decay=weight_decay,
+            decoupled_weight_decay=decoupled_weight_decay,
+        )
+    if weight_decay != 0.0 and decoupled_weight_decay:
+        param.mul_(1.0 - lr * weight_decay)
+    update_grad = grad
+    if weight_decay != 0.0 and not decoupled_weight_decay:
+        update_grad = grad.add(param, alpha=weight_decay)
+    denom_left = diag_left.to(update_grad.dtype) + ridge_left
+    denom_right = diag_right.to(update_grad.dtype) + ridge_right
+    if torch.any(denom_left <= 0) or torch.any(denom_right <= 0):
+        raise ValueError(
+            "Diagonal preconditioner entries must be positive after ridge regularization."
+        )
+    param.add_(
+        update_grad / (denom_left[:, None] * denom_right[None, :]),
+        alpha=-lr * update_scale,
+    )
     return param
 
 
