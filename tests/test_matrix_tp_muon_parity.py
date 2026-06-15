@@ -32,8 +32,24 @@ def _patch_all_reduce_to_global_gram(monkeypatch, global_gram: torch.Tensor) -> 
     return group
 
 
+def _patch_all_reduce_scale(monkeypatch, scale: float) -> _FakeGroup:
+    group = _FakeGroup()
+
+    def fake_all_reduce(tensor, op=None, group=None, async_op=False):
+        del op, async_op
+        assert group is not None
+        tensor.mul_(scale)
+        return None
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: int(scale))
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    return group
+
+
 def test_small_gram_muon_row_shards_match_full_local_update(monkeypatch):
-    matrix = torch.tensor(
+    local_matrix = torch.tensor(
         [
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
@@ -46,13 +62,14 @@ def test_small_gram_muon_row_shards_match_full_local_update(monkeypatch):
         ],
         dtype=torch.float32,
     )
+    matrix = torch.cat([local_matrix, local_matrix], dim=0)
     reference = tp_small_gram_newton_schulz_allreduce(
         matrix,
         tp_layout="none",
         steps=12,
         ridge=1e-5,
     )
-    group = _patch_all_reduce_to_global_gram(monkeypatch, matrix.t().matmul(matrix))
+    group = _patch_all_reduce_scale(monkeypatch, 2.0)
 
     sharded = torch.cat(
         [
@@ -72,7 +89,7 @@ def test_small_gram_muon_row_shards_match_full_local_update(monkeypatch):
 
 
 def test_small_gram_muon_column_shards_match_full_local_update(monkeypatch):
-    matrix = torch.tensor(
+    local_matrix = torch.tensor(
         [
             [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
             [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 2.0],
@@ -80,13 +97,14 @@ def test_small_gram_muon_column_shards_match_full_local_update(monkeypatch):
         ],
         dtype=torch.float32,
     )
+    matrix = torch.cat([local_matrix, local_matrix], dim=1)
     reference = tp_small_gram_newton_schulz_allreduce(
         matrix,
         tp_layout="none",
         steps=12,
         ridge=1e-5,
     )
-    group = _patch_all_reduce_to_global_gram(monkeypatch, matrix.matmul(matrix.t()))
+    group = _patch_all_reduce_scale(monkeypatch, 2.0)
 
     sharded = torch.cat(
         [
@@ -200,6 +218,39 @@ def _distributed_small_gram_muon_worker(rank: int, world_size: int, init_file: s
         )
         torch.testing.assert_close(row_update, row_reference, rtol=1e-5, atol=1e-5)
 
+        uneven_row_sharded_tall = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        local_uneven_rows = uneven_row_sharded_tall.chunk(world_size, dim=0)[rank].contiguous()
+        local_uneven_row_update = tp_small_gram_newton_schulz_allreduce(
+            local_uneven_rows,
+            tp_layout="column_parallel",
+            logical_shape=tuple(uneven_row_sharded_tall.shape),
+            steps=12,
+            ridge=1e-5,
+        )
+        gathered_uneven_rows = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_uneven_rows, local_uneven_row_update)
+        uneven_row_update = torch.cat(gathered_uneven_rows, dim=0)
+        uneven_row_reference = tp_small_gram_newton_schulz_allreduce(
+            uneven_row_sharded_tall,
+            tp_layout="none",
+            steps=12,
+            ridge=1e-5,
+        )
+        torch.testing.assert_close(
+            uneven_row_update, uneven_row_reference, rtol=1e-5, atol=1e-5
+        )
+
         column_sharded_wide = torch.tensor(
             [
                 [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0, 0.0],
@@ -225,6 +276,37 @@ def _distributed_small_gram_muon_worker(rank: int, world_size: int, init_file: s
             ridge=1e-5,
         )
         torch.testing.assert_close(col_update, col_reference, rtol=1e-5, atol=1e-5)
+
+        uneven_column_sharded_wide = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 2.0],
+                [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        local_uneven_cols = uneven_column_sharded_wide.chunk(world_size, dim=1)[
+            rank
+        ].contiguous()
+        local_uneven_col_update = tp_small_gram_newton_schulz_allreduce(
+            local_uneven_cols,
+            tp_layout="row_parallel",
+            logical_shape=tuple(uneven_column_sharded_wide.shape),
+            steps=12,
+            ridge=1e-5,
+        )
+        gathered_uneven_cols = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(gathered_uneven_cols, local_uneven_col_update)
+        uneven_col_update = torch.cat(gathered_uneven_cols, dim=1)
+        uneven_col_reference = tp_small_gram_newton_schulz_allreduce(
+            uneven_column_sharded_wide,
+            tp_layout="none",
+            steps=12,
+            ridge=1e-5,
+        )
+        torch.testing.assert_close(
+            uneven_col_update, uneven_col_reference, rtol=1e-5, atol=1e-5
+        )
     finally:
         torch.distributed.destroy_process_group()
 

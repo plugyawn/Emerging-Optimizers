@@ -38,6 +38,7 @@ __all__ = [
     "dense_feature_gram_to_block_diag",
     "diag_feature_gram_to_block_diag",
     "factorize_feature_gram",
+    "factorize_grad_gram",
     "FeatureGramFactorization",
     "feature_gram_to_diag",
     "locoprop_s_update",
@@ -348,13 +349,32 @@ def factorize_feature_gram(
 ) -> FeatureGramFactorization:
     """Build a reusable right-solve factor for a supported FEATURE_GRAM."""
 
-    c = _regularize_feature_gram(feature_gram, ridge)
+    return _factorize_symmetric_gram(feature_gram, ridge=ridge, gram_name="feature_gram")
+
+
+def factorize_grad_gram(
+    grad_gram: torch.Tensor,
+    *,
+    ridge: float = 0.0,
+) -> FeatureGramFactorization:
+    """Build a reusable left-solve factor for a supported GRAD_GRAM."""
+
+    return _factorize_symmetric_gram(grad_gram, ridge=ridge, gram_name="grad_gram")
+
+
+def _factorize_symmetric_gram(
+    gram: torch.Tensor,
+    *,
+    ridge: float,
+    gram_name: str,
+) -> FeatureGramFactorization:
+    c = _regularize_feature_gram(gram, ridge)
     compute_dtype = _matrix_solve_dtype(c.dtype)
     c = c.to(compute_dtype)
     if c.ndim == 1:
         if torch.any(c <= 0):
             raise ValueError(
-                "Diagonal feature_gram entries must be positive after ridge regularization."
+                f"Diagonal {gram_name} entries must be positive after ridge regularization."
             )
         return FeatureGramFactorization("diag", c)
     if c.ndim == 2:
@@ -368,7 +388,8 @@ def factorize_feature_gram(
             return FeatureGramFactorization("block_cholesky", chol)
         return FeatureGramFactorization("block_fallback", c)
     raise ValueError(
-        "feature_gram must be diagonal [p], dense [p, p], or block-diagonal [num_blocks, b, b]"
+        f"{gram_name} must be diagonal [p], dense [p, p], or "
+        "block-diagonal [num_blocks, b, b]"
     )
 
 

@@ -10,24 +10,26 @@ matrix or use the supported small-Gram polar all-reduce sides.
 
 from __future__ import annotations
 
-from typing import Callable, Literal
+from typing import Callable, Literal, Sequence
 
 import torch
 
 from emerging_optimizers.matrix_update_rules import newton_schulz_orthogonalize
+from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+    _COEFFICIENT_SETS,
+    get_coefficient_iterator,
+)
 
 TPLayout = Literal["none", "duplicated", "column_parallel", "row_parallel"]
 SmallGramSide = Literal["right", "left"]
-SmallGramOrientation = SmallGramSide
+NSCoeffT = Literal["simple", "quintic", "polar_express", "cans", "aol", "custom"]
 
 __all__ = [
     "TPLayout",
     "SmallGramSide",
-    "SmallGramOrientation",
     "allgather_logical_matrix",
     "shard_logical_matrix_like",
     "small_gram_newton_schulz_side",
-    "small_gram_newton_schulz_orientation",
     "tp_small_gram_newton_schulz_allreduce",
     "supports_small_gram_polar_allreduce",
     "tp_allgather_logical_matrix_update",
@@ -150,46 +152,6 @@ def _matrix_inverse_sqrt_psd(matrix: torch.Tensor, *, eps: float = 0.0) -> torch
     return (evecs * inv_sqrt.unsqueeze(0)) @ evecs.mT
 
 
-def _matrix_inverse_sqrt_newton_schulz(
-    matrix: torch.Tensor,
-    *,
-    steps: int,
-    ridge: float = 1e-6,
-    eps: float = 1e-12,
-) -> torch.Tensor:
-    """Approximate ``matrix^-1/2`` using PyTorch/cuBLAS-backed Gram NS.
-
-    This is a reference-performance backend, not a fused kernel. It keeps the
-    iteration on the small symmetric Gram so row/column-sharded Muon can avoid
-    all-gathering the full logical matrix during the optimizer step.
-    """
-
-    if steps < 1:
-        raise ValueError("steps must be >= 1")
-    if ridge < 0.0:
-        raise ValueError("ridge must be >= 0")
-    if eps <= 0.0:
-        raise ValueError("eps must be > 0")
-    _require_2d_matrix(matrix, "matrix")
-    if matrix.shape[-1] != matrix.shape[-2]:
-        raise ValueError("matrix inverse square root requires a square matrix")
-
-    gram = matrix.to(torch.float32)
-    gram = 0.5 * (gram + gram.mT)
-    eye = torch.eye(gram.shape[-1], device=gram.device, dtype=gram.dtype)
-    if ridge != 0.0:
-        gram = gram + ridge * eye
-
-    scale = torch.linalg.matrix_norm(gram, ord="fro").clamp_min(eps)
-    y = gram / scale
-    z = eye
-    for _ in range(steps):
-        t = torch.addmm(3.0 * eye, z, y, beta=1.0, alpha=-1.0).mul_(0.5)
-        y = y @ t
-        z = t @ z
-    return z / torch.sqrt(scale)
-
-
 def supports_small_gram_polar_allreduce(
     local_matrix: torch.Tensor,
     *,
@@ -217,6 +179,7 @@ def small_gram_newton_schulz_side(
     *,
     tp_layout: TPLayout,
     group: torch.distributed.ProcessGroup | None = None,
+    logical_shape: tuple[int, int] | None = None,
 ) -> SmallGramSide:
     """Return the exact small-Gram NS side for this local matrix.
 
@@ -229,18 +192,51 @@ def small_gram_newton_schulz_side(
     _require_2d_matrix(local_matrix, "local_matrix")
     world_size = _dist_world_size(group)
     rows, cols = local_matrix.shape[-2:]
+    if logical_shape is not None:
+        if len(logical_shape) != 2:
+            raise ValueError(f"logical_shape must be 2D, got {logical_shape}")
+        logical_rows, logical_cols = logical_shape
+        if tp_layout in ("none", "duplicated") and (logical_rows, logical_cols) != (rows, cols):
+            raise ValueError(
+                "unsharded small-Gram NS logical_shape must match local_matrix shape: "
+                f"logical_shape={logical_shape}, local_shape={tuple(local_matrix.shape)}."
+            )
+        if tp_layout == "column_parallel" and logical_cols != cols:
+            raise ValueError(
+                "column_parallel small-Gram NS logical_shape must preserve the local "
+                f"feature dimension: logical_shape={logical_shape}, local_shape={tuple(local_matrix.shape)}."
+            )
+        if tp_layout == "column_parallel" and logical_rows < rows:
+            raise ValueError(
+                "column_parallel small-Gram NS logical_shape cannot be smaller than the local "
+                f"row shard: logical_shape={logical_shape}, local_shape={tuple(local_matrix.shape)}."
+            )
+        if tp_layout == "row_parallel" and logical_rows != rows:
+            raise ValueError(
+                "row_parallel small-Gram NS logical_shape must preserve the local "
+                f"output dimension: logical_shape={logical_shape}, local_shape={tuple(local_matrix.shape)}."
+            )
+        if tp_layout == "row_parallel" and logical_cols < cols:
+            raise ValueError(
+                "row_parallel small-Gram NS logical_shape cannot be smaller than the local "
+                f"column shard: logical_shape={logical_shape}, local_shape={tuple(local_matrix.shape)}."
+            )
+    else:
+        logical_rows, logical_cols = rows, cols
+        if world_size > 1 and tp_layout == "column_parallel":
+            logical_rows = rows * world_size
+        elif world_size > 1 and tp_layout == "row_parallel":
+            logical_cols = cols * world_size
     if world_size == 1 or tp_layout in ("none", "duplicated"):
-        return "right" if rows >= cols else "left"
+        return "right" if logical_rows >= logical_cols else "left"
     if tp_layout == "column_parallel":
-        logical_rows = rows * world_size
-        if logical_rows < cols:
+        if logical_rows < logical_cols:
             raise ValueError(
                 "small-Gram NS all-reduce for column_parallel requires a tall logical matrix."
             )
         return "right"
     if tp_layout == "row_parallel":
-        logical_cols = cols * world_size
-        if logical_cols < rows:
+        if logical_cols < logical_rows:
             raise ValueError(
                 "small-Gram NS all-reduce for row_parallel requires a wide logical matrix."
             )
@@ -248,15 +244,66 @@ def small_gram_newton_schulz_side(
     raise ValueError(f"Unsupported TP layout: {tp_layout}")
 
 
-def small_gram_newton_schulz_orientation(
-    local_matrix: torch.Tensor,
+def _newton_schulz_coefficients(
     *,
-    tp_layout: TPLayout,
-    group: torch.distributed.ProcessGroup | None = None,
-) -> SmallGramSide:
-    """Compatibility alias for ``small_gram_newton_schulz_side``."""
+    steps: int,
+    coefficient_type: NSCoeffT,
+    custom_coefficient_sets: Sequence[tuple[float, float, float]] | None,
+):
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if coefficient_type in _COEFFICIENT_SETS:
+        coefficient_sets = _COEFFICIENT_SETS[coefficient_type]
+    elif coefficient_type == "custom":
+        if custom_coefficient_sets is None:
+            raise ValueError("custom_coefficient_sets must be provided when coefficient_type is 'custom'.")
+        coefficient_sets = custom_coefficient_sets
+    else:
+        raise ValueError(f"Invalid coefficient type: {coefficient_type}")
+    iter_mode = "repeat_last" if coefficient_type in ("polar_express", "cans") else "cycle"
+    return get_coefficient_iterator(steps, coefficient_sets, mode=iter_mode)
 
-    return small_gram_newton_schulz_side(local_matrix, tp_layout=tp_layout, group=group)
+
+def _normalize_small_gram_matrix(
+    matrix: torch.Tensor,
+    *,
+    distributed: bool,
+    group: torch.distributed.ProcessGroup | None,
+    eps: float,
+) -> torch.Tensor:
+    norm_sq = torch.sum(matrix * matrix)
+    if distributed:
+        torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.SUM, group=group)
+    return matrix / torch.sqrt(norm_sq).clamp_min(eps)
+
+
+def _small_gram_newton_schulz_step(
+    matrix: torch.Tensor,
+    *,
+    side: SmallGramSide,
+    distributed: bool,
+    group: torch.distributed.ProcessGroup | None,
+    a: float,
+    b: float,
+    c: float,
+    ridge: float,
+) -> torch.Tensor:
+    if side == "right":
+        gram = matrix.mT @ matrix
+        if distributed:
+            torch.distributed.all_reduce(gram, op=torch.distributed.ReduceOp.SUM, group=group)
+        if ridge != 0.0:
+            gram = gram + ridge * torch.eye(gram.shape[-1], device=gram.device, dtype=gram.dtype)
+        gram_sq = gram @ gram
+        return a * matrix + b * (matrix @ gram) + c * (matrix @ gram_sq)
+
+    gram = matrix @ matrix.mT
+    if distributed:
+        torch.distributed.all_reduce(gram, op=torch.distributed.ReduceOp.SUM, group=group)
+    if ridge != 0.0:
+        gram = gram + ridge * torch.eye(gram.shape[-1], device=gram.device, dtype=gram.dtype)
+    gram_sq = gram @ gram
+    return a * matrix + b * (gram @ matrix) + c * (gram_sq @ matrix)
 
 
 def tp_small_gram_polar_allreduce(
@@ -324,8 +371,13 @@ def tp_small_gram_newton_schulz_allreduce(
     *,
     tp_layout: TPLayout,
     group: torch.distributed.ProcessGroup | None = None,
+    logical_shape: tuple[int, int] | None = None,
     steps: int = 8,
-    ridge: float = 1e-6,
+    coefficient_type: NSCoeffT = "quintic",
+    custom_coefficient_sets: Sequence[tuple[float, float, float]] | None = None,
+    ridge: float = 0.0,
+    eps: float = 1e-7,
+    use_syrk: bool = False,
 ) -> torch.Tensor:
     """Reference row/column-sharded Muon update using all-reduced small Gram NS.
 
@@ -334,42 +386,58 @@ def tp_small_gram_newton_schulz_allreduce(
     ``row_parallel`` weights are column-sharded, so the exact small Gram is
     ``sum_i M_i @ M_i.T`` and each rank applies the left factor locally.
 
-    This helper is intended as the semantic/reference path for TP parity tests
-    and future matrix-axis-aware DP/FSDP experiments. It is not wired to
-    Megatron-FSDP. It uses PyTorch matmul/addmm so CUDA execution is backed by
-    cuBLAS/cuBLASLt, while avoiding full-matrix all-gather.
+    This helper is the semantic/reference path for TP parity tests and
+    matrix-axis-aware DP/FSDP experiments. It applies the same Muon
+    Newton-Schulz coefficient schedule as the full-matrix helper, but rewrites
+    each polynomial step through the small Gram so CUDA execution is backed by
+    PyTorch matmul/cuBLAS while avoiding full-matrix all-gather.
     """
 
     _require_2d_matrix(local_matrix, "local_matrix")
+    if ridge < 0.0:
+        raise ValueError("ridge must be >= 0")
+    if eps <= 0.0:
+        raise ValueError("eps must be > 0")
+    if use_syrk:
+        raise NotImplementedError(
+            "tp_small_gram_newton_schulz_allreduce does not implement TSYRK-backed "
+            "small-Gram substeps yet; pass use_syrk=False."
+        )
     world_size = _dist_world_size(group)
     matrix = local_matrix.to(torch.float32)
 
     side = small_gram_newton_schulz_side(
-        local_matrix, tp_layout=tp_layout, group=group
+        local_matrix,
+        tp_layout=tp_layout,
+        group=group,
+        logical_shape=logical_shape,
+    )
+    distributed = world_size > 1 and tp_layout not in ("none", "duplicated")
+    matrix = _normalize_small_gram_matrix(
+        matrix,
+        distributed=distributed,
+        group=group,
+        eps=eps,
+    )
+    coeff_iter = _newton_schulz_coefficients(
+        steps=steps,
+        coefficient_type=coefficient_type,
+        custom_coefficient_sets=custom_coefficient_sets,
     )
 
-    if world_size == 1 or tp_layout in ("none", "duplicated"):
-        if side == "right":
-            gram = matrix.mT @ matrix
-            factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
-            return (matrix @ factor).to(torch.float32)
-        gram = matrix @ matrix.mT
-        factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
-        return (factor @ matrix).to(torch.float32)
+    for a, b, c in coeff_iter:
+        matrix = _small_gram_newton_schulz_step(
+            matrix,
+            side=side,
+            distributed=distributed,
+            group=group,
+            a=a,
+            b=b,
+            c=c,
+            ridge=ridge,
+        )
 
-    if tp_layout == "column_parallel":
-        gram = matrix.mT @ matrix
-        torch.distributed.all_reduce(gram, op=torch.distributed.ReduceOp.SUM, group=group)
-        factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
-        return (matrix @ factor).to(torch.float32)
-
-    if tp_layout == "row_parallel":
-        gram = matrix @ matrix.mT
-        torch.distributed.all_reduce(gram, op=torch.distributed.ReduceOp.SUM, group=group)
-        factor = _matrix_inverse_sqrt_newton_schulz(gram, steps=steps, ridge=ridge)
-        return (factor @ matrix).to(torch.float32)
-
-    raise ValueError(f"Unsupported TP layout: {tp_layout}")
+    return matrix.to(torch.float32)
 
 
 def tp_block_local_approx(

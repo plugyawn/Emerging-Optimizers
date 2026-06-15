@@ -377,6 +377,19 @@ def _diag_feature_gram_fallback(
     return value
 
 
+def _validate_diag_gram_out(x: torch.Tensor, out: torch.Tensor) -> None:
+    if out.dim() != 1:
+        raise ValueError("out must be one-dimensional")
+    if out.shape[0] != x.shape[-1]:
+        raise ValueError("out length must match the Gram feature dimension")
+    if out.device != x.device:
+        raise ValueError("out must be on the same device as the input")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if not out.is_floating_point():
+        raise ValueError("out must use a floating-point dtype")
+
+
 def diag_feature_gram_reduce(
     x: torch.Tensor,
     *,
@@ -394,8 +407,13 @@ def diag_feature_gram_reduce(
     if out is None:
         out = torch.empty((x.shape[-1],), device=x.device, dtype=torch.float32)
         accumulate = False
+    else:
+        _validate_diag_gram_out(x, out)
     if count is not None:
-        count.fill_(float(x.shape[0]))
+        if accumulate:
+            count.add_(float(x.shape[0]))
+        else:
+            count.fill_(float(x.shape[0]))
     if not HAS_TRITON_DIAG_GRAM or not x.is_cuda:
         value = _diag_feature_gram_fallback(
             x, mean=mean, ridge=ridge, reciprocal=reciprocal

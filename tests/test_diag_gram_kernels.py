@@ -42,10 +42,25 @@ class FeatureGramKernelFallbackTest(absltest.TestCase):
     def test_diag_feature_gram_reduce_accumulates_into_existing_buffer(self):
         x = torch.tensor([[1.0, 2.0, 3.0]])
         out = torch.ones(3)
+        count = torch.tensor(4.0)
 
-        diag_feature_gram_reduce(x, out=out, accumulate=True)
+        diag_feature_gram_reduce(x, out=out, count=count, accumulate=True)
 
         torch.testing.assert_close(out, torch.tensor([2.0, 5.0, 10.0]))
+        torch.testing.assert_close(count, torch.tensor(5.0))
+
+    def test_diag_feature_gram_reduce_rejects_invalid_out(self):
+        x = torch.tensor([[1.0, 2.0, 3.0]])
+
+        with self.assertRaisesRegex(ValueError, "out length"):
+            diag_feature_gram_reduce(x, out=torch.empty(2))
+
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            diag_feature_gram_reduce(x, out=torch.empty(6)[::2])
+
+        if torch.cuda.is_available():
+            with self.assertRaisesRegex(ValueError, "same device"):
+                diag_feature_gram_reduce(x.cuda(), out=torch.empty(3))
 
     def test_diag_grad_gram_reduce_fallback_matches_torch(self):
         dy = torch.tensor([[1.0, 2.0], [3.0, 5.0], [7.0, 11.0]])

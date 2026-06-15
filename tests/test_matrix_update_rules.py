@@ -13,6 +13,7 @@ from emerging_optimizers.matrix_update_rules import (
     dense_feature_gram_to_block_diag,
     diag_feature_gram_to_block_diag,
     factorize_feature_gram,
+    factorize_grad_gram,
     feature_gram_to_diag,
     locoprop_s_update,
     newton_muon_update,
@@ -198,6 +199,10 @@ class MatrixUpdateRulesTest(absltest.TestCase):
             right_precondition_with_factorized_feature_gram(grad, factorization),
             grad / torch.tensor([3.0, 5.0]),
         )
+
+    def test_factorized_grad_gram_has_output_side_error_name(self):
+        with self.assertRaisesRegex(ValueError, "grad_gram"):
+            factorize_grad_gram(torch.tensor([1.0, -2.0]), ridge=0.0)
 
     def test_right_precondition_diag_feature_gram(self):
         grad = torch.tensor([[2.0, 8.0], [4.0, 16.0]])

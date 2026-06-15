@@ -216,10 +216,8 @@ class MatrixTPApplyTest(absltest.TestCase):
             torch.testing.assert_close(update, left_factor @ local)
 
     def test_small_gram_ns_column_parallel_matches_full_reference(self):
-        shards = [
-            torch.tensor([[1.0, 0.25], [0.5, 2.0], [1.25, -0.5]]),
-            torch.tensor([[-0.75, 1.25], [2.0, -1.0], [0.5, 0.75]]),
-        ]
+        local = torch.tensor([[1.0, 0.25], [0.5, 2.0], [1.25, -0.5]])
+        shards = [local, local]
         full = torch.cat(shards, dim=0)
         full_update = tp_small_gram_newton_schulz_allreduce(
             full,
@@ -227,10 +225,8 @@ class MatrixTPApplyTest(absltest.TestCase):
             steps=12,
             ridge=1e-5,
         )
-        full_gram = full.mT @ full
-
         for rank, local in enumerate(shards):
-            with fake_distributed(world_size=2, rank=rank, all_reduce_value=full_gram):
+            with fake_distributed(world_size=2, rank=rank, all_reduce_scale=2.0):
                 update = tp_small_gram_newton_schulz_allreduce(
                     local,
                     tp_layout="column_parallel",
@@ -240,10 +236,8 @@ class MatrixTPApplyTest(absltest.TestCase):
             torch.testing.assert_close(update, full_update.chunk(2, dim=0)[rank])
 
     def test_small_gram_ns_row_parallel_matches_full_reference(self):
-        shards = [
-            torch.tensor([[1.0, 0.25, -0.5], [0.5, 2.0, 1.25]]),
-            torch.tensor([[-0.75, 1.25, 0.5], [2.0, -1.0, 0.75]]),
-        ]
+        local = torch.tensor([[1.0, 0.25, -0.5], [0.5, 2.0, 1.25]])
+        shards = [local, local]
         full = torch.cat(shards, dim=1)
         full_update = tp_small_gram_newton_schulz_allreduce(
             full,
@@ -251,10 +245,8 @@ class MatrixTPApplyTest(absltest.TestCase):
             steps=12,
             ridge=1e-5,
         )
-        full_gram = full @ full.mT
-
         for rank, local in enumerate(shards):
-            with fake_distributed(world_size=2, rank=rank, all_reduce_value=full_gram):
+            with fake_distributed(world_size=2, rank=rank, all_reduce_scale=2.0):
                 update = tp_small_gram_newton_schulz_allreduce(
                     local,
                     tp_layout="row_parallel",
@@ -262,6 +254,42 @@ class MatrixTPApplyTest(absltest.TestCase):
                     ridge=1e-5,
                 )
             torch.testing.assert_close(update, full_update.chunk(2, dim=1)[rank])
+
+    def test_small_gram_ns_accepts_explicit_logical_shape(self):
+        local = torch.tensor([[1.0, 0.25, -0.5]])
+
+        with fake_distributed(world_size=2, rank=0, all_reduce_scale=2.0):
+            update = tp_small_gram_newton_schulz_allreduce(
+                local,
+                tp_layout="column_parallel",
+                logical_shape=(4, 3),
+                steps=2,
+            )
+
+        self.assertEqual(update.shape, local.shape)
+
+    def test_small_gram_ns_rejects_incompatible_logical_shape(self):
+        local = torch.tensor([[1.0, 0.25, -0.5]])
+
+        with fake_distributed(world_size=2, rank=0):
+            with self.assertRaisesRegex(ValueError, "preserve the local feature dimension"):
+                tp_small_gram_newton_schulz_allreduce(
+                    local,
+                    tp_layout="column_parallel",
+                    logical_shape=(4, 4),
+                    steps=2,
+                )
+
+    def test_small_gram_ns_rejects_unsharded_logical_shape_mismatch(self):
+        local = torch.tensor([[1.0, 0.25, -0.5]])
+
+        with self.assertRaisesRegex(ValueError, "must match local_matrix shape"):
+            tp_small_gram_newton_schulz_allreduce(
+                local,
+                tp_layout="none",
+                logical_shape=(2, 3),
+                steps=2,
+            )
 
     def test_small_gram_rejects_unsupported_column_orientation(self):
         local = torch.empty(1, 4)
